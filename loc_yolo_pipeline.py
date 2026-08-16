@@ -403,6 +403,19 @@ def get_json(
     return response.json()
 
 
+def is_permanent_http_error(exc: Exception) -> bool:
+    """
+    True for 4xx responses (403 Forbidden, 404 Not Found, ...): the server
+    has deliberately refused this exact request, so retrying the same URL
+    with backoff has no realistic chance of succeeding and just burns time.
+    5xx errors, timeouts, and connection errors are treated as transient and
+    still get the full retry/backoff treatment.
+    """
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return isinstance(status_code, int) and 400 <= status_code < 500
+
+
 def get_json_with_retry(
     session: requests.Session,
     url: str,
@@ -415,8 +428,8 @@ def get_json_with_retry(
     for attempt in range(retries):
         try:
             return get_json(session, url, timeout, sleep_seconds)
-        except Exception:
-            if attempt == retries - 1:
+        except Exception as exc:
+            if is_permanent_http_error(exc) or attempt == retries - 1:
                 raise
             time.sleep(delay)
             delay = min(delay * 2, 30.0)
@@ -459,14 +472,13 @@ def search_books_paginated(
                 data = response.json()
                 break
             except Exception as exc:
-                if attempt == retries - 1:
+                if is_permanent_http_error(exc) or attempt == retries - 1:
                     print(
-                        f"[warn] search failed for query={query!r} sp={sp} "
-                        f"after {retries} attempts: {exc}"
+                        f"[warn] search failed for query={query!r} sp={sp}: {exc}"
                     )
-                else:
-                    time.sleep(delay)
-                    delay = min(delay * 2, 30.0)
+                    break
+                time.sleep(delay)
+                delay = min(delay * 2, 30.0)
 
         if data is None:
             break
@@ -781,8 +793,8 @@ def download_image_with_retry(
                 sleep_seconds=sleep_seconds,
             )
             return
-        except Exception:
-            if attempt == retries - 1:
+        except Exception as exc:
+            if is_permanent_http_error(exc) or attempt == retries - 1:
                 raise
             time.sleep(delay)
             delay = min(delay * 2, 30.0)
