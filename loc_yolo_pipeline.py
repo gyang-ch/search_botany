@@ -12,11 +12,17 @@ Workflow
    Presentation manifest (falling back to LOC item "files" resources when a
    manifest can't be found), same approach as loc_vlm_triage.py.
 3. Walk every page of the book, ONE PAGE AT A TIME:
-     a. download the page image to local disk
-     b. run it through the YOLO model on the GPU (CUDA) immediately
+     a. download the page image to local disk (LOC/manifest HTTP calls all
+        use the same exponential-backoff retry as image downloads)
+     b. run it through the YOLO model on the GPU (CUDA) immediately,
+        recording every detection's class, confidence, AND bounding box
+        (xyxy) - the GPU cost is already paid, so nothing is discarded
      c. if any detected class is plant-related  -> upload to Azure Blob
         Storage, then delete the local file
-        if no plant-related class is detected   -> delete the local file
+        if no plant-related class is detected   -> delete the local file,
+        UNLESS it's randomly chosen for the negative QC audit sample
+        (--negative-sample-rate), in which case it's uploaded to
+        negative_audit/ instead of being discarded outright
    The pipeline never holds more than one page image on local disk at a
    time, which keeps a RunPod pod's ephemeral storage bounded no matter how
    many/large the books are.
@@ -24,8 +30,20 @@ Workflow
    killed/restarted run resumes mid-book instead of re-downloading or
    re-uploading pages. A book already fully processed under one keyword is
    skipped when a later keyword matches the same LOC item again.
+   A page-level error (network drop, LOC 500, Azure failure) does NOT
+   advance next_page_index and does NOT get counted as processed - the book
+   stops there and the SAME page is retried on the next run, up to
+   --max-page-retries attempts (across runs) before the book is marked
+   "failed_permanent" and skipped like a completed book. This avoids
+   silently creating holes in a book's page sequence.
 5. Every page decision (kept/deleted/error) is appended to page_log.jsonl
    for audit purposes.
+6. Book-level bibliographic metadata (title/author/date/subjects/language),
+   page counts, plant-detection totals, and an illustration_density
+   (positive_pages / total_pages) ratio are written to books.jsonl, one
+   line per book, updated whenever that book's processing state changes.
+   Use it to rank newly discovered books by how plant-illustration-dense
+   they are without re-running detection.
 
 Default YOLO model
 -------------------
@@ -79,6 +97,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import shutil
 import sys
@@ -133,6 +152,7 @@ DEFAULT_PLANT_CLASS_KEYWORDS = ["plant"]
 DEFAULT_MAX_BOOKS_PER_KEYWORD = 100
 DEFAULT_TIMEOUT = 60
 DEFAULT_RETRIES = 5
+DEFAULT_MAX_PAGE_RETRIES = 5
 
 
 # --------------------------------------------------------------------------
@@ -297,6 +317,20 @@ def parse_args() -> argparse.Namespace:
         help="Optional blob name prefix, e.g. 'botany/'.",
     )
     parser.add_argument(
+        "--negative-sample-rate",
+        type=float,
+        default=0.0,
+        help="Fraction (0-1) of YOLO-negative pages to keep anyway for "
+        "quality-control audit, e.g. 0.01 = 1%%. They are uploaded to "
+        "--negative-audit-prefix instead of being deleted outright. "
+        "Default: 0 (audit disabled).",
+    )
+    parser.add_argument(
+        "--negative-audit-prefix",
+        default="negative_audit",
+        help="Blob prefix for the negative audit sample. Default: negative_audit",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Run detection and delete local files as usual, but skip the "
@@ -320,7 +354,16 @@ def parse_args() -> argparse.Namespace:
         "--retries",
         type=int,
         default=DEFAULT_RETRIES,
-        help="Maximum HTTP retries per request.",
+        help="Maximum HTTP retries per request (search, metadata, manifest, "
+        "and image downloads all use the same exponential backoff).",
+    )
+    parser.add_argument(
+        "--max-page-retries",
+        type=int,
+        default=DEFAULT_MAX_PAGE_RETRIES,
+        help="Maximum times a single page is retried across separate runs "
+        "before its book is marked failed_permanent and skipped like a "
+        f"completed book. Default: {DEFAULT_MAX_PAGE_RETRIES}",
     )
 
     return parser.parse_args()
@@ -360,6 +403,27 @@ def get_json(
     return response.json()
 
 
+def get_json_with_retry(
+    session: requests.Session,
+    url: str,
+    timeout: int,
+    sleep_seconds: float,
+    retries: int,
+) -> dict[str, Any]:
+    delay = 2.0
+
+    for attempt in range(retries):
+        try:
+            return get_json(session, url, timeout, sleep_seconds)
+        except Exception:
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 30.0)
+
+    raise RuntimeError("Unreachable JSON retry state.")
+
+
 def search_books_paginated(
     session: requests.Session,
     query: str,
@@ -367,6 +431,7 @@ def search_books_paginated(
     max_results: int,
     timeout: int,
     sleep_seconds: float,
+    retries: int = DEFAULT_RETRIES,
     start_page: int = 1,
 ) -> list[dict[str, Any]]:
     endpoint = (
@@ -384,12 +449,26 @@ def search_books_paginated(
         if query:
             params["q"] = query
 
-        try:
-            response = session.get(endpoint, params=params, timeout=timeout)
-            response.raise_for_status()
-            data = response.json()
-        except Exception as exc:
-            print(f"[warn] search failed for query={query!r} sp={sp}: {exc}")
+        data: dict[str, Any] | None = None
+        delay = 2.0
+
+        for attempt in range(retries):
+            try:
+                response = session.get(endpoint, params=params, timeout=timeout)
+                response.raise_for_status()
+                data = response.json()
+                break
+            except Exception as exc:
+                if attempt == retries - 1:
+                    print(
+                        f"[warn] search failed for query={query!r} sp={sp} "
+                        f"after {retries} attempts: {exc}"
+                    )
+                else:
+                    time.sleep(delay)
+                    delay = min(delay * 2, 30.0)
+
+        if data is None:
             break
 
         page_results = data.get("results", [])
@@ -617,6 +696,45 @@ def parse_iiif_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return pages
 
 
+def extract_book_metadata(item_data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Best-effort bibliographic metadata extraction. LOC's item JSON schema
+    varies across collections, so every field is looked up under a few
+    plausible key names and left as None/[] rather than raising when absent.
+    """
+    item = item_data.get("item", item_data)
+    if not isinstance(item, dict):
+        item = {}
+
+    def first_str(*keys: str) -> str | None:
+        for key in keys:
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, list) and value and isinstance(value[0], str):
+                if value[0].strip():
+                    return value[0].strip()
+        return None
+
+    def str_list(*keys: str) -> list[str]:
+        for key in keys:
+            value = item.get(key)
+            if isinstance(value, list) and value:
+                return [str(v).strip() for v in value if str(v).strip()]
+            if isinstance(value, str) and value.strip():
+                return [value.strip()]
+        return []
+
+    return {
+        "title": first_str("title"),
+        "author": ", ".join(str_list("contributor_names", "creator", "creators"))
+        or None,
+        "date": first_str("date", "dates", "created_published_date"),
+        "subjects": str_list("subject_headings", "subject", "subjects"),
+        "language": ", ".join(str_list("language", "languages")) or None,
+    }
+
+
 def download_image(
     session: requests.Session,
     image_url: str,
@@ -717,7 +835,17 @@ def detect_plant(
     imgsz: int,
     conf_threshold: float,
     plant_class_keywords: list[str],
-) -> tuple[bool, list[dict[str, Any]], float]:
+) -> tuple[bool, list[dict[str, Any]], float, int]:
+    """
+    Returns (has_plant, detected, plant_max_confidence, plant_detection_count).
+
+    `detected` includes every detection (not just plant classes) with its
+    bounding box, since the GPU cost of computing it is already paid and it
+    is useful later for cropping, false-positive audits, and thesis figures.
+    `plant_max_confidence`/`plant_detection_count` are scoped to
+    plant-related classes only, since a high-confidence non-plant detection
+    (e.g. "human") shouldn't count toward a page/book's plant signal.
+    """
     results = model.predict(
         source=str(image_path),
         device=device,
@@ -727,7 +855,8 @@ def detect_plant(
     )
 
     detected: list[dict[str, Any]] = []
-    max_confidence = 0.0
+    plant_max_confidence = 0.0
+    plant_detection_count = 0
     has_plant = False
     keywords_lower = [kw.lower() for kw in plant_class_keywords]
 
@@ -737,21 +866,34 @@ def detect_plant(
         if boxes is None or len(boxes) == 0:
             continue
 
-        for cls_idx, confidence in zip(
-            boxes.cls.tolist(), boxes.conf.tolist()
+        for cls_idx, confidence, bbox in zip(
+            boxes.cls.tolist(), boxes.conf.tolist(), boxes.xyxy.tolist()
         ):
-            class_name = names[int(cls_idx)] if isinstance(names, (list, dict)) else str(cls_idx)
-            if isinstance(names, dict):
-                class_name = names.get(int(cls_idx), str(cls_idx))
+            class_name = (
+                names.get(int(cls_idx), str(int(cls_idx)))
+                if isinstance(names, dict)
+                else str(names[int(cls_idx)])
+            )
 
             confidence = float(confidence)
-            detected.append({"class": class_name, "confidence": confidence})
-            max_confidence = max(max_confidence, confidence)
+            is_plant = any(
+                keyword in class_name.lower() for keyword in keywords_lower
+            )
 
-            if any(keyword in class_name.lower() for keyword in keywords_lower):
+            detected.append(
+                {
+                    "class": class_name,
+                    "confidence": confidence,
+                    "bbox_xyxy": [round(float(v), 2) for v in bbox],
+                }
+            )
+
+            if is_plant:
                 has_plant = True
+                plant_detection_count += 1
+                plant_max_confidence = max(plant_max_confidence, confidence)
 
-    return has_plant, detected, max_confidence
+    return has_plant, detected, plant_max_confidence, plant_detection_count
 
 
 # --------------------------------------------------------------------------
@@ -831,9 +973,42 @@ def append_log(path: Path, record: dict[str, Any]) -> None:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def load_books(path: Path) -> dict[str, dict[str, Any]]:
+    books: dict[str, dict[str, Any]] = {}
+    if not path.exists():
+        return books
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            item_id = record.get("loc_item_id")
+            if item_id:
+                books[item_id] = record
+
+    return books
+
+
+def save_books_atomic(path: Path, books: dict[str, dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with temp_path.open("w", encoding="utf-8") as handle:
+        for record in books.values():
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    temp_path.replace(path)
+
+
 # --------------------------------------------------------------------------
 # Per-page / per-book pipeline
 # --------------------------------------------------------------------------
+
+
+def build_blob_name(prefix: str, item_id: str, page_index: int) -> str:
+    prefix = prefix.strip("/")
+    tail = f"{safe_id(item_id)}/page_{page_index + 1:05d}.jpg"
+    return f"{prefix}/{tail}" if prefix else tail
 
 
 def process_page(
@@ -862,6 +1037,7 @@ def process_page(
         "action": None,
         "blob_name": None,
         "detected_classes": [],
+        "plant_detection_count": 0,
         "max_confidence": None,
         "error": None,
     }
@@ -878,25 +1054,23 @@ def process_page(
         )
 
         # 2. Run it through YOLO on the GPU immediately.
-        has_plant, detected, max_confidence = detect_plant(
-            model=model,
-            image_path=tmp_path,
-            device=device,
-            imgsz=args.imgsz,
-            conf_threshold=args.conf_threshold,
-            plant_class_keywords=args.plant_class_keywords,
+        has_plant, detected, plant_max_confidence, plant_detection_count = (
+            detect_plant(
+                model=model,
+                image_path=tmp_path,
+                device=device,
+                imgsz=args.imgsz,
+                conf_threshold=args.conf_threshold,
+                plant_class_keywords=args.plant_class_keywords,
+            )
         )
         record["detected_classes"] = detected
-        record["max_confidence"] = max_confidence
+        record["plant_detection_count"] = plant_detection_count
+        record["max_confidence"] = plant_max_confidence if has_plant else None
 
         # 3a. Plant detected -> upload, then delete local copy.
         if has_plant:
-            prefix = args.azure_prefix.strip("/")
-            blob_name = (
-                f"{prefix}/{safe_id(item_id)}/page_{page_index + 1:05d}.jpg"
-                if prefix
-                else f"{safe_id(item_id)}/page_{page_index + 1:05d}.jpg"
-            )
+            blob_name = build_blob_name(args.azure_prefix, item_id, page_index)
 
             if not args.dry_run:
                 upload_image_to_blob(container_client, blob_name, tmp_path)
@@ -906,7 +1080,23 @@ def process_page(
 
             record["blob_name"] = blob_name
 
-        # 3b. No plant -> delete local copy, nothing uploaded.
+        # 3b. No plant -> normally delete local copy, nothing uploaded,
+        # except for a small random slice kept as a negative QC audit
+        # sample (uploaded, not just left on disk, so review doesn't
+        # require re-running this whole pipeline).
+        elif args.negative_sample_rate > 0 and random.random() < args.negative_sample_rate:
+            blob_name = build_blob_name(
+                args.negative_audit_prefix, item_id, page_index
+            )
+
+            if not args.dry_run:
+                upload_image_to_blob(container_client, blob_name, tmp_path)
+                record["action"] = "deleted_no_plant_audited"
+            else:
+                record["action"] = "deleted_no_plant_audited_dry_run"
+
+            record["blob_name"] = blob_name
+
         else:
             record["action"] = "deleted_no_plant"
 
@@ -931,6 +1121,7 @@ def process_book(
     args: argparse.Namespace,
     device: str,
     state: dict[str, Any],
+    books: dict[str, dict[str, Any]],
     log_path: Path,
     keyword: str,
 ) -> None:
@@ -940,23 +1131,63 @@ def process_book(
         return
 
     item_state = state.get(item_id)
+    terminal_statuses = ("completed", "failed_permanent")
 
-    if item_state and item_state.get("status") == "completed":
+    if item_state and item_state.get("status") in terminal_statuses:
         keywords_matched = item_state.setdefault("keywords_matched", [])
         if keyword not in keywords_matched:
             keywords_matched.append(keyword)
             save_state_atomic(args.state_path, state)
-        print(f"[skip] {item_id} already completed")
+            book_record = books.get(item_id)
+            if book_record is not None:
+                book_record["keywords_matched"] = keywords_matched
+                save_books_atomic(args.books_path, books)
+        print(f"[skip] {item_id} already {item_state.get('status')}")
         return
 
     print(f"\n[book] {item_id} (keyword={keyword!r})")
+
+    metadata: dict[str, Any] = {}
+    manifest_url: str | None = None
+    total_pages = item_state.get("page_count", 0) if item_state else 0
+
+    def flush_book_record(status: str) -> None:
+        current = state.get(item_id, {})
+        pages_kept = current.get("pages_kept", 0)
+        books[item_id] = {
+            "loc_item_id": item_id,
+            "loc_url": f"{LOC_BASE}/item/{item_id}/",
+            "manifest_url": manifest_url,
+            "title": metadata.get("title"),
+            "author": metadata.get("author"),
+            "date": metadata.get("date"),
+            "subjects": metadata.get("subjects", []),
+            "language": metadata.get("language"),
+            "status": status,
+            "total_pages": total_pages,
+            "positive_pages": pages_kept,
+            "illustration_density": (
+                pages_kept / total_pages if total_pages else None
+            ),
+            "total_plant_detections": current.get("total_plant_detections", 0),
+            "max_confidence": current.get("max_confidence"),
+            "pages_negative_audited": current.get("pages_negative_audited", 0),
+            "keywords_matched": current.get("keywords_matched", [keyword]),
+            "last_updated_utc": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            ),
+        }
+        save_books_atomic(args.books_path, books)
 
     try:
         metadata_url = item_json_url(result)
         if not metadata_url:
             raise RuntimeError("Could not construct LOC item JSON URL.")
 
-        item_data = get_json(session, metadata_url, args.timeout, args.sleep)
+        item_data = get_json_with_retry(
+            session, metadata_url, args.timeout, args.sleep, args.retries
+        )
+        metadata = extract_book_metadata(item_data)
 
         manifest_url = recursive_find_manifest_url(item_data)
         if manifest_url and manifest_url.startswith("//"):
@@ -966,8 +1197,8 @@ def process_book(
 
         if manifest_url:
             try:
-                manifest_data = get_json(
-                    session, manifest_url, args.timeout, args.sleep
+                manifest_data = get_json_with_retry(
+                    session, manifest_url, args.timeout, args.sleep, args.retries
                 )
                 pages = parse_iiif_manifest(manifest_data)
             except Exception as exc:
@@ -984,6 +1215,7 @@ def process_book(
                 "keywords_matched": [keyword],
             }
             save_state_atomic(args.state_path, state)
+            flush_book_record("failed")
             return
 
         total_pages = len(pages)
@@ -994,6 +1226,19 @@ def process_book(
         start_index = item_state.get("next_page_index", 0) if item_state else 0
         pages_kept = item_state.get("pages_kept", 0) if item_state else 0
         pages_deleted = item_state.get("pages_deleted", 0) if item_state else 0
+        pages_negative_audited = (
+            item_state.get("pages_negative_audited", 0) if item_state else 0
+        )
+        total_plant_detections = (
+            item_state.get("total_plant_detections", 0) if item_state else 0
+        )
+        book_max_confidence = (
+            item_state.get("max_confidence", 0.0) if item_state else 0.0
+        )
+        failed_pages = list(item_state.get("failed_pages", [])) if item_state else []
+        failed_page_retry = (
+            dict(item_state.get("failed_page_retry", {})) if item_state else {}
+        )
         keywords_matched = (
             list(item_state.get("keywords_matched", [])) if item_state else []
         )
@@ -1002,6 +1247,22 @@ def process_book(
 
         tmp_dir = args.output_dir / "tmp_page" / safe_id(item_id)
         tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        def save_progress(status: str) -> None:
+            state[item_id] = {
+                "status": status,
+                "next_page_index": next_page_index,
+                "page_count": total_pages,
+                "pages_kept": pages_kept,
+                "pages_deleted": pages_deleted,
+                "pages_negative_audited": pages_negative_audited,
+                "total_plant_detections": total_plant_detections,
+                "max_confidence": book_max_confidence,
+                "keywords_matched": keywords_matched,
+                "failed_pages": failed_pages,
+                "failed_page_retry": failed_page_retry,
+            }
+            save_state_atomic(args.state_path, state)
 
         for page_index in range(start_index, total_pages):
             record = process_page(
@@ -1018,23 +1279,63 @@ def process_book(
                 log_path=log_path,
             )
 
+            # A page-level error must NOT advance next_page_index - the
+            # book stops here so the same page is retried (not silently
+            # skipped) on the next run.
+            if record["action"] == "error":
+                retry_count = (
+                    failed_page_retry.get("count", 0) + 1
+                    if failed_page_retry.get("page_index") == page_index
+                    else 1
+                )
+                failed_page_retry = {"page_index": page_index, "count": retry_count}
+                failed_pages.append(
+                    {
+                        "page_index": page_index,
+                        "attempt": retry_count,
+                        "error": record["error"],
+                        "at_utc": time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                        ),
+                    }
+                )
+
+                next_page_index = page_index  # do not advance past the failure
+                if retry_count >= args.max_page_retries:
+                    print(
+                        f"[error] {item_id}: page {page_index + 1} failed "
+                        f"{retry_count} times; giving up on this book "
+                        f"(failed_permanent): {record['error']}"
+                    )
+                    save_progress("failed_permanent")
+                else:
+                    print(
+                        f"[warn] {item_id}: page {page_index + 1} failed "
+                        f"(attempt {retry_count}/{args.max_page_retries}); "
+                        f"stopping book for later retry: {record['error']}"
+                    )
+                    save_progress("in_progress")
+
+                flush_book_record(state[item_id]["status"])
+                return
+
             if record["action"] in ("kept_uploaded", "kept_dry_run"):
                 pages_kept += 1
-            elif record["action"] == "deleted_no_plant":
+                total_plant_detections += record.get("plant_detection_count", 0)
+                confidence = record.get("max_confidence")
+                if confidence is not None:
+                    book_max_confidence = max(book_max_confidence, confidence)
+            elif record["action"].startswith("deleted_no_plant"):
                 pages_deleted += 1
+                if "audited" in record["action"]:
+                    pages_negative_audited += 1
 
-            state[item_id] = {
-                "status": "in_progress",
-                "next_page_index": page_index + 1,
-                "page_count": total_pages,
-                "pages_kept": pages_kept,
-                "pages_deleted": pages_deleted,
-                "keywords_matched": keywords_matched,
-            }
-            save_state_atomic(args.state_path, state)
+            next_page_index = page_index + 1
+            save_progress("in_progress")
 
         state[item_id]["status"] = "completed"
         save_state_atomic(args.state_path, state)
+        flush_book_record("completed")
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1055,6 +1356,7 @@ def process_book(
             "keywords_matched": sorted(keywords_matched),
         }
         save_state_atomic(args.state_path, state)
+        flush_book_record("failed")
 
 
 # --------------------------------------------------------------------------
@@ -1067,6 +1369,7 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.state_path = args.output_dir / "processed_items.json"
+    args.books_path = args.output_dir / "books.jsonl"
     log_path = args.output_dir / "page_log.jsonl"
 
     device = resolve_device(args.device, args.allow_cpu)
@@ -1092,6 +1395,7 @@ def main() -> int:
         )
 
     state = load_state(args.state_path)
+    books = load_books(args.books_path)
     session = make_session()
 
     keywords = args.keywords or DEFAULT_KEYWORDS
@@ -1110,6 +1414,7 @@ def main() -> int:
                 max_results=args.max_books_per_keyword,
                 timeout=args.timeout,
                 sleep_seconds=args.sleep,
+                retries=args.retries,
                 start_page=args.start_page,
             )
         except Exception as exc:
@@ -1127,21 +1432,37 @@ def main() -> int:
                 args=args,
                 device=device,
                 state=state,
+                books=books,
                 log_path=log_path,
                 keyword=keyword,
             )
 
     completed = sum(1 for v in state.values() if v.get("status") == "completed")
+    in_progress = sum(1 for v in state.values() if v.get("status") == "in_progress")
     failed = sum(1 for v in state.values() if v.get("status") == "failed")
+    failed_permanent = sum(
+        1 for v in state.values() if v.get("status") == "failed_permanent"
+    )
     kept_total = sum(v.get("pages_kept", 0) for v in state.values())
     deleted_total = sum(v.get("pages_deleted", 0) for v in state.values())
+    audited_total = sum(
+        v.get("pages_negative_audited", 0) for v in state.values()
+    )
+    detections_total = sum(
+        v.get("total_plant_detections", 0) for v in state.values()
+    )
 
     print("\n=== Run complete ===")
     print(f"Books completed: {completed}")
-    print(f"Books failed: {failed}")
+    print(f"Books paused for retry (in_progress): {in_progress}")
+    print(f"Books failed (will retry next run): {failed}")
+    print(f"Books failed_permanent (gave up, page retries exhausted): {failed_permanent}")
     print(f"Pages kept (uploaded to Azure): {kept_total}")
     print(f"Pages deleted (no plant detected): {deleted_total}")
+    print(f"Negative pages kept for QC audit: {audited_total}")
+    print(f"Total plant detections (boxes, incl. multiple per page): {detections_total}")
     print(f"State file: {args.state_path}")
+    print(f"Books metadata: {args.books_path}")
     print(f"Page log: {log_path}")
 
     return 0
