@@ -1,0 +1,6 @@
+requests
+ultralytics
+azure-storage-blob
+python-dotenv
+# torch/torchvision are usually preinstalled on RunPod CUDA images.
+# If not, install a CUDA build first from https://pytorch.org/get-started/locally/

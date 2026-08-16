@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.pyc
+loc_yolo_run/
+loc_triage/
