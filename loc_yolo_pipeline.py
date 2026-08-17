@@ -1371,6 +1371,57 @@ def process_book(
         flush_book_record("failed")
 
 
+def sweep_paused_books(
+    *,
+    session: requests.Session,
+    model,
+    container_client,
+    args: argparse.Namespace,
+    device: str,
+    state: dict[str, Any],
+    books: dict[str, dict[str, Any]],
+    log_path: Path,
+) -> None:
+    """
+    Resume every book currently paused ("in_progress") after a page-level
+    error. A book only pauses because download_image_with_retry already
+    exhausted its own backoff and still failed - the fix is elapsed
+    wall-clock time (LOC/tile.loc.gov transient issues tend to clear up),
+    not another immediate retry. Calling this between keyword searches (and
+    once more at the end of the run) gives every paused book that gap
+    naturally, instead of leaving it stuck until the same item happens to
+    resurface under a later keyword's search results.
+    """
+    paused_ids = [
+        item_id
+        for item_id, item_state in state.items()
+        if item_state.get("status") == "in_progress"
+    ]
+
+    if not paused_ids:
+        return
+
+    print(f"\n=== Resuming {len(paused_ids)} paused book(s) ===")
+
+    for item_id in paused_ids:
+        keywords_matched = state.get(item_id, {}).get("keywords_matched") or []
+        keyword = keywords_matched[-1] if keywords_matched else "resume"
+        result = {"id": f"{LOC_BASE}/item/{item_id}/"}
+
+        process_book(
+            result=result,
+            session=session,
+            model=model,
+            container_client=container_client,
+            args=args,
+            device=device,
+            state=state,
+            books=books,
+            log_path=log_path,
+            keyword=keyword,
+        )
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -1448,6 +1499,30 @@ def main() -> int:
                 log_path=log_path,
                 keyword=keyword,
             )
+
+        sweep_paused_books(
+            session=session,
+            model=model,
+            container_client=container_client,
+            args=args,
+            device=device,
+            state=state,
+            books=books,
+            log_path=log_path,
+        )
+
+    # One more pass once every keyword has been searched, in case a book
+    # paused during the last keyword never got a chance to be swept.
+    sweep_paused_books(
+        session=session,
+        model=model,
+        container_client=container_client,
+        args=args,
+        device=device,
+        state=state,
+        books=books,
+        log_path=log_path,
+    )
 
     completed = sum(1 for v in state.values() if v.get("status") == "completed")
     in_progress = sum(1 for v in state.values() if v.get("status") == "in_progress")
