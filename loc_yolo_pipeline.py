@@ -102,6 +102,7 @@ import re
 import shutil
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -405,15 +406,49 @@ def get_json(
 
 def is_permanent_http_error(exc: Exception) -> bool:
     """
-    True for 4xx responses (403 Forbidden, 404 Not Found, ...): the server
-    has deliberately refused this exact request, so retrying the same URL
-    with backoff has no realistic chance of succeeding and just burns time.
-    5xx errors, timeouts, and connection errors are treated as transient and
-    still get the full retry/backoff treatment.
+    True for 4xx responses the server used to deliberately refuse this exact
+    request (403 Forbidden, 404 Not Found, ...) - retrying the same URL with
+    backoff has no realistic chance of succeeding and just burns time.
+
+    429 Too Many Requests is deliberately excluded even though it's a 4xx:
+    it means "you're going too fast," which is the definition of transient -
+    it gets the full retry/backoff treatment (honoring Retry-After if the
+    server sends one), same as 5xx errors, timeouts, and connection errors.
     """
     response = getattr(exc, "response", None)
     status_code = getattr(response, "status_code", None)
-    return isinstance(status_code, int) and 400 <= status_code < 500
+    if not isinstance(status_code, int):
+        return False
+    if status_code == 429:
+        return False
+    return 400 <= status_code < 500
+
+
+def retry_delay_seconds(exc: Exception, backoff_delay: float) -> float:
+    """
+    Use the server's Retry-After header when present (common on 429s) since
+    it's a more accurate cooldown than a guessed exponential backoff;
+    otherwise fall back to the exponential backoff already in progress.
+    """
+    response = getattr(exc, "response", None)
+    retry_after = None
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+
+    if retry_after:
+        try:
+            return max(backoff_delay, float(retry_after))
+        except ValueError:
+            try:
+                from email.utils import parsedate_to_datetime
+
+                target = parsedate_to_datetime(retry_after)
+                now = datetime.now(target.tzinfo) if target.tzinfo else datetime.utcnow()
+                return max(backoff_delay, (target - now).total_seconds())
+            except Exception:
+                pass
+
+    return backoff_delay
 
 
 def get_json_with_retry(
@@ -431,7 +466,7 @@ def get_json_with_retry(
         except Exception as exc:
             if is_permanent_http_error(exc) or attempt == retries - 1:
                 raise
-            time.sleep(delay)
+            time.sleep(retry_delay_seconds(exc, delay))
             delay = min(delay * 2, 30.0)
 
     raise RuntimeError("Unreachable JSON retry state.")
@@ -477,7 +512,7 @@ def search_books_paginated(
                         f"[warn] search failed for query={query!r} sp={sp}: {exc}"
                     )
                     break
-                time.sleep(delay)
+                time.sleep(retry_delay_seconds(exc, delay))
                 delay = min(delay * 2, 30.0)
 
         if data is None:
@@ -796,7 +831,7 @@ def download_image_with_retry(
         except Exception as exc:
             if is_permanent_http_error(exc) or attempt == retries - 1:
                 raise
-            time.sleep(delay)
+            time.sleep(retry_delay_seconds(exc, delay))
             delay = min(delay * 2, 30.0)
 
     raise RuntimeError("Unreachable image retry state.")
