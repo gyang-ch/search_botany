@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 loc_yolo_run/
 loc_triage/
+bodleian_yolo_run/
+.DS_Store
