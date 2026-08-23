@@ -34,7 +34,12 @@ try:
 except ImportError:
     pass
 
-RUN_DIRS = ["loc_yolo_run", "bodleian_yolo_run", "british_library_yolo_run"]
+RUN_DIRS = [
+    "loc_yolo_run",
+    "bodleian_yolo_run",
+    "bodleian_illustration_yolo_run",
+    "british_library_yolo_run",
+]
 FILENAMES = ["books.jsonl", "page_log.jsonl", "processed_items.json"]
 
 CONTENT_TYPES = {

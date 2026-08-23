@@ -4,5 +4,7 @@ __pycache__/
 loc_yolo_run/
 loc_triage/
 bodleian_yolo_run/
+bodleian_illustration_yolo_run/
 british_library_yolo_run/
 .DS_Store
+state_backups/
