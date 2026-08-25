@@ -34,11 +34,17 @@ try:
 except ImportError:
     pass
 
+# (blob sub-prefix, local run dir). The illustration pipelines nest under
+# "illustration_runs/" - keep this in sync with each pipeline's own
+# --state-azure-prefix default, since that's the path its in-run periodic
+# backup writes to; this script's ad-hoc backups should land in the same
+# place, not a sibling path that never gets cleaned up.
 RUN_DIRS = [
-    "loc_yolo_run",
-    "bodleian_yolo_run",
-    "bodleian_illustration_yolo_run",
-    "british_library_yolo_run",
+    ("", "loc_yolo_run"),
+    ("", "bodleian_yolo_run"),
+    ("", "british_library_yolo_run"),
+    ("illustration_runs/", "bodleian_illustration_yolo_run"),
+    ("illustration_runs/", "gallica_illustration_yolo_run"),
 ]
 FILENAMES = ["books.jsonl", "page_log.jsonl", "processed_items.json"]
 
@@ -95,7 +101,7 @@ def main() -> int:
     timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
 
     to_upload: list[tuple[Path, str]] = []
-    for run_dir in RUN_DIRS:
+    for sub_prefix, run_dir in RUN_DIRS:
         dir_path = root / run_dir
         if not dir_path.is_dir():
             print(f"[skip] {run_dir}/ not found")
@@ -105,7 +111,7 @@ def main() -> int:
             if not local_path.is_file():
                 print(f"[skip] {run_dir}/{filename} not found")
                 continue
-            blob_name = f"{prefix}/{run_dir}/{filename}"
+            blob_name = f"{prefix}/{sub_prefix}{run_dir}/{filename}"
             to_upload.append((local_path, blob_name))
 
     if not to_upload:
@@ -128,10 +134,10 @@ def main() -> int:
 
     # Also write a timestamped copy of processed_items.json so you keep a
     # history of state snapshots over time, not just the latest overwrite.
-    for run_dir in RUN_DIRS:
+    for sub_prefix, run_dir in RUN_DIRS:
         local_path = root / run_dir / "processed_items.json"
         if local_path.is_file():
-            snap_blob = f"{prefix}/{run_dir}/snapshots/processed_items_{timestamp}.json"
+            snap_blob = f"{prefix}/{sub_prefix}{run_dir}/snapshots/processed_items_{timestamp}.json"
             print(f"[snapshot] {local_path} -> {snap_blob}")
             upload_file(container_client, local_path, snap_blob)
 
