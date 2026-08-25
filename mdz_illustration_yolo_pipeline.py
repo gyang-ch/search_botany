@@ -212,11 +212,11 @@ pip install -r requirements.txt
 # https://pytorch.org/get-started/locally/ (see this project's notes on
 # picking a CUDA build that matches `nvidia-smi`'s reported CUDA Version).
 
-Running all three illustration pipelines at once
----------------------------------------------------
-This script and the other two illustration pipelines write to fully
+Running all four illustration pipelines at once
+----------------------------------------------------
+This script and the other three illustration pipelines write to fully
 separate local directories and Azure prefixes (see "IMPORTANT" above), so
-it's safe to run all three concurrently in their own tmux sessions on the
+it's safe to run all four concurrently in their own tmux sessions on the
 same pod:
 
     tmux new -s bodleian_illustration
@@ -234,16 +234,23 @@ same pod:
     python mdz_illustration_yolo_pipeline.py
     # detach: Ctrl-b d
 
+    tmux new -s wellcome_illustration
+    conda activate botany_yolo
+    python wellcome_illustration_yolo_pipeline.py
+    # detach: Ctrl-b d
+
     tmux attach -t bodleian_illustration   # reattach to check on any of them
     tmux attach -t gallica_illustration
     tmux attach -t mdz_illustration
+    tmux attach -t wellcome_illustration
     tmux ls                                 # list all sessions
 
-All three scripts default --device to the same auto-detected cuda:0, so on
-a single-GPU pod they will share that one GPU's compute/VRAM - fine for a
-pod like an RTX A4000 (16GB) running three small YOLO models concurrently
+All four scripts default --device to the same auto-detected cuda:0, so on a
+single-GPU pod they will share that one GPU's compute/VRAM - fine for a pod
+like an RTX A4000 (16GB) running four small YOLO models concurrently
 (they'll interleave GPU time rather than truly run in parallel), but if you
-have a multi-GPU pod, pass --device cuda:1/cuda:2 to spread them out.
+have a multi-GPU pod, pass --device cuda:1/cuda:2/cuda:3 to spread them
+out.
 
 Example
 -------
