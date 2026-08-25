@@ -7,7 +7,7 @@ searching for pages with RICH ILLUSTRATION rather than plant content.
 Sibling script to bodleian_yolo_pipeline.py (the botany/plant pipeline) -
 same one-page-at-a-time GPU triage and Azure upload strategy, same Digital
 Bodleian API, different keyword list and a different fine-tuned YOLO model
-(page_layout_best.pt instead of best.pt).
+(page_layout_best_new.pt instead of best.pt).
 
 IMPORTANT - keeping this separate from the botany pipeline's data
 --------------------------------------------------------------------------
@@ -17,16 +17,16 @@ matched (e.g. an illuminated herbal). Both pipelines key blobs off the
 Bodleian object id and a page number, so if they ever shared an Azure
 prefix, a page kept by one pipeline could silently overwrite a page kept by
 the other. To make that impossible by construction, this pipeline:
-  - defaults --azure-prefix to "illustrations/bodleian" (the botany
+  - defaults --azure-prefix to "illustrations/bodleian_new" (the botany
     pipeline defaults to "", i.e. the container root),
-  - defaults --negative-audit-prefix to "illustrations/bodleian/negative_audit",
+  - defaults --negative-audit-prefix to "illustrations/bodleian_new/negative_audit",
   - defaults --output-dir to "bodleian_illustration_yolo_run" (the botany
     pipeline uses "bodleian_yolo_run"), so local state files never collide
     either,
   - defaults --state-azure-prefix (see below) to
-    "state_backups/bodleian_illustration_yolo_run", distinct from the
+    "state_backups/illustration_runs/bodleian_illustration_yolo_run", distinct from the
     botany pipeline's "state_backups/bodleian_yolo_run".
-This "<task>/<library>" prefix shape (illustrations/bodleian, and later
+This "<task>/<library>" prefix shape (illustrations/bodleian_new, and later
 e.g. illustrations/loc, illustrations/british_library) is the file
 management plan for adding more libraries to the illustration search later:
 each new library gets its own sibling script and its own prefix under
@@ -113,7 +113,7 @@ Workflow
 
 Default YOLO model
 -------------------
-Defaults to ./page_layout_best.pt, a YOLOv11 model fine-tuned for this
+Defaults to ./page_layout_best_new.pt, a YOLOv11 model fine-tuned for this
 project with two classes:
     illustration, text_block
 A page is treated as "contains a rich illustration" when any detected class
@@ -211,24 +211,24 @@ USER_AGENT = (
 )
 
 DEFAULT_KEYWORDS = [
-    "astronomy",
-    "cosmography",
-    "bestiary",
-    "book of hours",
-    "apocalypse",
-    "illuminated",
-    "atlas",
     "geometry",
     "instruments",
     "costume",
     "ornament",
     "heraldry",
     "medicine",
+    "illuminated",
+    "atlas",
+    "astronomy",
+    "cosmography",
+    "bestiary",
+    "book of hours",
+    "apocalypse",
 ]
 
-DEFAULT_YOLO_MODEL = str(SCRIPT_DIR / "page_layout_best.pt")
+DEFAULT_YOLO_MODEL = str(SCRIPT_DIR / "page_layout_best_new.pt")
 DEFAULT_IMGSZ = 640
-DEFAULT_CONF_THRESHOLD = 0.25
+DEFAULT_CONF_THRESHOLD = 0.30
 DEFAULT_ILLUSTRATION_CLASS_KEYWORDS = ["illustration"]
 
 DEFAULT_MAX_BOOKS_PER_KEYWORD = 100
@@ -239,8 +239,8 @@ DEFAULT_MAX_PAGE_RETRIES = 5
 DEFAULT_MIN_PAGES_PER_BOOK = 5
 DEFAULT_EDGE_SKIP_THRESHOLD = 20
 DEFAULT_EDGE_SKIP_COUNT = 5
-DEFAULT_STATE_AZURE_PREFIX = "state_backups/bodleian_illustration_yolo_run"
-DEFAULT_STATE_UPLOAD_INTERVAL = 300.0
+DEFAULT_STATE_AZURE_PREFIX = "state_backups/illustration_runs/bodleian_illustration_yolo_run"
+DEFAULT_STATE_UPLOAD_INTERVAL = 3000.0
 
 
 # --------------------------------------------------------------------------
@@ -432,9 +432,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--azure-prefix",
-        default="illustrations/bodleian",
+        default="illustrations/bodleian_new",
         help="Blob name prefix for kept page images. Defaults to "
-        "'illustrations/bodleian' (NOT the container root) so this "
+        "'illustrations/bodleian_new' (NOT the container root) so this "
         "pipeline's images can never collide with the botany pipeline's "
         "(which defaults to no prefix) even inside the same container.",
     )
@@ -449,9 +449,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--negative-audit-prefix",
-        default="illustrations/bodleian/negative_audit",
+        default="illustrations/bodleian_new/negative_audit",
         help="Blob prefix for the negative audit sample. Default: "
-        "illustrations/bodleian/negative_audit",
+        "illustrations/bodleian_new/negative_audit",
     )
     parser.add_argument(
         "--state-azure-prefix",
