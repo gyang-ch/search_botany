@@ -176,9 +176,10 @@ python bodleian_illustration_yolo_pipeline.py --dry-run --max-books-per-keyword 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
-import random
+import platform
 import re
 import shutil
 import sys
@@ -200,6 +201,12 @@ except ImportError:
 BODLEIAN_BASE = "https://digital.bodleian.ox.ac.uk"
 BODLEIAN_SEARCH_URL = f"{BODLEIAN_BASE}/search/"
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+# Generic source identifier used in page_log.jsonl/run_metadata.json so
+# records from different library pipelines can eventually be pooled and
+# distinguished by a single consistent field name.
+SOURCE_NAME = "bodleian"
+SOURCE_DISPLAY_NAME = "Digital Bodleian"
 
 _contact = os.environ.get("BODLEIAN_CONTACT_EMAIL", "").strip()
 USER_AGENT = (
@@ -241,6 +248,7 @@ DEFAULT_EDGE_SKIP_THRESHOLD = 20
 DEFAULT_EDGE_SKIP_COUNT = 5
 DEFAULT_STATE_AZURE_PREFIX = "state_backups/illustration_runs/bodleian_illustration_yolo_run"
 DEFAULT_STATE_UPLOAD_INTERVAL = 3000.0
+DEFAULT_NEGATIVE_SAMPLE_RATE = 0.02
 
 
 # --------------------------------------------------------------------------
@@ -441,11 +449,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--negative-sample-rate",
         type=float,
-        default=0.0,
+        default=DEFAULT_NEGATIVE_SAMPLE_RATE,
         help="Fraction (0-1) of YOLO-negative pages to keep anyway for "
         "quality-control audit, e.g. 0.01 = 1%%. They are uploaded to "
         "--negative-audit-prefix instead of being deleted outright. "
-        "Default: 0 (audit disabled).",
+        "Selection is deterministic (SHA-256 of source+item id+page id), "
+        "not random, so the same page is always chosen or not chosen "
+        f"across reruns. Default: {DEFAULT_NEGATIVE_SAMPLE_RATE} "
+        f"({DEFAULT_NEGATIVE_SAMPLE_RATE * 100:.0f}%%).",
     )
     parser.add_argument(
         "--negative-audit-prefix",
@@ -784,6 +795,8 @@ def parse_iiif_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
                         "label": str(label),
                         "image_service": service_base,
                         "image_url": f"{service_base}/full/1200,/0/default.jpg",
+                        "canvas_width": canvas.get("width"),
+                        "canvas_height": canvas.get("height"),
                     }
                 )
 
@@ -819,6 +832,8 @@ def parse_iiif_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
                         "label": str(label),
                         "image_service": service_base,
                         "image_url": f"{service_base}/full/1200,/0/default.jpg",
+                        "canvas_width": canvas.get("width"),
+                        "canvas_height": canvas.get("height"),
                     }
                 )
 
@@ -1004,17 +1019,24 @@ def detect_illustration(
     imgsz: int,
     conf_threshold: float,
     illustration_class_keywords: list[str],
-) -> tuple[bool, list[dict[str, Any]], float, int]:
+) -> tuple[bool, list[dict[str, Any]], float, int, int | None, int | None]:
     """
-    Returns (has_illustration, detected, illustration_max_confidence, illustration_detection_count).
+    Returns (has_illustration, detected, illustration_max_confidence,
+    illustration_detection_count, image_width, image_height).
 
     `detected` includes every detection (not just illustration classes) with
     its bounding box, since the GPU cost of computing it is already paid and
     it is useful later for cropping, false-positive audits, and thesis
-    figures. `illustration_max_confidence`/`illustration_detection_count`
-    are scoped to illustration-related classes only, since a high-confidence
-    "text_block" detection shouldn't count toward a page/book's illustration
-    signal.
+    figures. Each detection carries the pixel bbox_xyxy AND
+    bbox_normalized_xyxy (each coordinate divided by the actual image
+    width/height) plus bbox_area_ratio (box area / total image area).
+    image_width/image_height are the ACTUAL decoded pixel dimensions of
+    image_path, read from YOLO's own orig_shape rather than assumed to equal
+    the requested IIIF width - a source image can legitimately come back a
+    different size than requested. `illustration_max_confidence`/
+    `illustration_detection_count` are scoped to illustration-related
+    classes only, since a high-confidence "text_block" detection shouldn't
+    count toward a page/book's illustration signal.
     """
     results = model.predict(
         source=str(image_path),
@@ -1023,6 +1045,13 @@ def detect_illustration(
         conf=conf_threshold,
         verbose=False,
     )
+
+    image_width: int | None = None
+    image_height: int | None = None
+    if results:
+        orig_shape = getattr(results[0], "orig_shape", None)
+        if orig_shape:
+            image_height, image_width = int(orig_shape[0]), int(orig_shape[1])
 
     detected: list[dict[str, Any]] = []
     illustration_max_confidence = 0.0
@@ -1050,11 +1079,30 @@ def detect_illustration(
                 keyword in class_name.lower() for keyword in keywords_lower
             )
 
+            bbox_xyxy = [round(float(v), 2) for v in bbox]
+
+            bbox_normalized_xyxy: list[float] | None = None
+            bbox_area_ratio: float | None = None
+            if image_width and image_height:
+                x1, y1, x2, y2 = bbox_xyxy
+                bbox_normalized_xyxy = [
+                    round(x1 / image_width, 4),
+                    round(y1 / image_height, 4),
+                    round(x2 / image_width, 4),
+                    round(y2 / image_height, 4),
+                ]
+                box_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+                bbox_area_ratio = round(
+                    box_area / (image_width * image_height), 6
+                )
+
             detected.append(
                 {
                     "class": class_name,
                     "confidence": confidence,
-                    "bbox_xyxy": [round(float(v), 2) for v in bbox],
+                    "bbox_xyxy": bbox_xyxy,
+                    "bbox_normalized_xyxy": bbox_normalized_xyxy,
+                    "bbox_area_ratio": bbox_area_ratio,
                 }
             )
 
@@ -1063,7 +1111,35 @@ def detect_illustration(
                 illustration_detection_count += 1
                 illustration_max_confidence = max(illustration_max_confidence, confidence)
 
-    return has_illustration, detected, illustration_max_confidence, illustration_detection_count
+    return (
+        has_illustration,
+        detected,
+        illustration_max_confidence,
+        illustration_detection_count,
+        image_width,
+        image_height,
+    )
+
+
+# --------------------------------------------------------------------------
+# Deterministic negative-audit sampling
+# --------------------------------------------------------------------------
+
+
+def negative_audit_sample_value(source: str, item_id: str, page_identifier: str) -> float:
+    """
+    Deterministic replacement for random.random() - a page must always land
+    on the same side of --negative-sample-rate across reruns, machines, and
+    resumed runs, which a process-seeded PRNG can't guarantee. Hashing a
+    stable key (source + item id + canvas/page id-or-index) with SHA-256 and
+    mapping its first 8 bytes to [0, 1) gives a value that's reproducible
+    anywhere yet still spreads pages uniformly across [0, 1) for sampling.
+    Deliberately NOT Python's built-in hash(): it's randomized per-process
+    (PYTHONHASHSEED) and not stable across runs/machines.
+    """
+    key = f"{source}:{item_id}:{page_identifier}".encode("utf-8")
+    digest = hashlib.sha256(key).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64
 
 
 # --------------------------------------------------------------------------
@@ -1142,17 +1218,24 @@ def upload_state_file_to_blob(container_client, blob_name: str, local_path: Path
 
 def backup_state_to_azure(container_client, args: argparse.Namespace) -> None:
     """
-    Upload the current processed_items.json/books.jsonl/page_log.jsonl to
-    Azure under --state-azure-prefix, each upload overwriting the file
-    already there. A RunPod pod's local disk is ephemeral and the pod can
-    die without warning, so this is the safety net that keeps a killed
-    run's progress recoverable even if the local --output-dir is lost.
+    Upload the current processed_items.json/books.jsonl/page_log.jsonl/
+    run_metadata.json to Azure under --state-azure-prefix, each upload
+    overwriting the file already there. A RunPod pod's local disk is
+    ephemeral and the pod can die without warning, so this is the safety
+    net that keeps a killed run's progress - and the record of exactly
+    which model/config produced it - recoverable even if the local
+    --output-dir is lost.
     """
     if container_client is None:
         return
 
     prefix = args.state_azure_prefix.strip("/")
-    for local_path in (args.state_path, args.books_path, args.page_log_path):
+    for local_path in (
+        args.state_path,
+        args.books_path,
+        args.page_log_path,
+        args.run_metadata_path,
+    ):
         if not local_path.exists():
             continue
         blob_name = f"{prefix}/{local_path.name}"
@@ -1181,6 +1264,93 @@ def maybe_backup_state_to_azure(
 
     backup_state_to_azure(container_client, args)
     args.last_state_upload_time = now
+
+
+# --------------------------------------------------------------------------
+# Run metadata (which model/config produced this corpus)
+# --------------------------------------------------------------------------
+
+
+def compute_sha256(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_run_metadata(args: argparse.Namespace, model, device: str) -> dict[str, Any]:
+    """
+    Snapshot of exactly which model/config produced this corpus - written
+    once to run_metadata.json in --output-dir (see
+    load_or_create_run_metadata) and mirrored to Azure alongside the other
+    state files.
+    """
+    import torch
+    import ultralytics
+
+    names = model.names
+    class_names = list(names.values()) if isinstance(names, dict) else list(names)
+
+    device_info: dict[str, Any] = {"cuda_available": torch.cuda.is_available()}
+    if torch.cuda.is_available():
+        try:
+            index = torch.cuda.current_device()
+            device_info["cuda_version"] = torch.version.cuda
+            device_info["gpu_name"] = torch.cuda.get_device_name(index)
+        except Exception:
+            pass
+
+    return {
+        "source": SOURCE_NAME,
+        "source_name": SOURCE_DISPLAY_NAME,
+        "run_start_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "yolo_model_path": str(args.yolo_model),
+        "yolo_model_sha256": compute_sha256(Path(args.yolo_model)),
+        "model_class_names": class_names,
+        "imgsz": args.imgsz,
+        "conf_threshold": args.conf_threshold,
+        "illustration_class_keywords": args.illustration_class_keywords,
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "ultralytics_version": ultralytics.__version__,
+        "device": device,
+        **device_info,
+    }
+
+
+def load_or_create_run_metadata(
+    path: Path, args: argparse.Namespace, model, device: str
+) -> dict[str, Any]:
+    """
+    Write run_metadata.json exactly once per --output-dir. A resumed run
+    must NOT regenerate/overwrite it with a different snapshot - the whole
+    point is that it identifies the model/config that produced the corpus
+    already sitting in --output-dir and Azure, even if a later resume uses
+    different flags. If the weights on disk no longer match the recorded
+    hash, warn loudly (likely means --yolo-model was swapped without
+    starting a fresh --output-dir) but still leave the file untouched.
+    """
+    if path.exists():
+        with path.open("r", encoding="utf-8") as handle:
+            existing = json.load(handle)
+        current_hash = compute_sha256(Path(args.yolo_model))
+        recorded_hash = existing.get("yolo_model_sha256")
+        if current_hash and recorded_hash and current_hash != recorded_hash:
+            print(
+                "[warn] run_metadata.json's recorded yolo_model_sha256 does "
+                "not match the currently loaded weights - this --output-dir "
+                "was previously used with a different model. Leaving "
+                "run_metadata.json unchanged; start a fresh --output-dir if "
+                "you intend to mix models."
+            )
+        return existing
+
+    metadata = build_run_metadata(args, model, device)
+    save_state_atomic(path, metadata)
+    return metadata
 
 
 # --------------------------------------------------------------------------
@@ -1256,25 +1426,42 @@ def process_page(
     device: str,
     item_id: str,
     keyword: str,
+    manifest_url: str | None,
     page: dict[str, Any],
     page_index: int,
     tmp_dir: Path,
     log_path: Path,
 ) -> dict[str, Any]:
-    page_id = safe_id(str(page.get("id", page_index)))
+    page_identifier = str(page.get("id", page_index))
+    page_id = safe_id(page_identifier)
     tmp_path = tmp_dir / f"page_{page_index + 1:05d}_{page_id}.jpg"
 
     record: dict[str, Any] = {
-        "bodleian_item_id": item_id,
+        # Generic, source-agnostic provenance fields - the same field names
+        # other library pipelines in this project also write, so records
+        # can eventually be pooled.
+        "source": SOURCE_NAME,
+        "source_item_id": item_id,
+        "bodleian_item_id": item_id,  # kept for backward compatibility
         "keyword": keyword,
+        "manifest_url": manifest_url,
+        "canvas_id": page.get("id"),
+        "page_label": page.get("label"),
         "page_index": page_index,
         "page_number": page_index + 1,
+        "image_service_url": page.get("image_service"),
         "image_url": page.get("image_url"),
+        "source_width": page.get("canvas_width"),
+        "source_height": page.get("canvas_height"),
+        "downloaded_width": None,
+        "downloaded_height": None,
         "action": None,
         "blob_name": None,
         "detected_classes": [],
         "illustration_detection_count": 0,
         "max_confidence": None,
+        "negative_audit_selected": None,
+        "negative_audit_sample_value": None,
         "error": None,
     }
 
@@ -1290,19 +1477,26 @@ def process_page(
         )
 
         # 2. Run it through YOLO on the GPU immediately.
-        has_illustration, detected, illustration_max_confidence, illustration_detection_count = (
-            detect_illustration(
-                model=model,
-                image_path=tmp_path,
-                device=device,
-                imgsz=args.imgsz,
-                conf_threshold=args.conf_threshold,
-                illustration_class_keywords=args.illustration_class_keywords,
-            )
+        (
+            has_illustration,
+            detected,
+            illustration_max_confidence,
+            illustration_detection_count,
+            image_width,
+            image_height,
+        ) = detect_illustration(
+            model=model,
+            image_path=tmp_path,
+            device=device,
+            imgsz=args.imgsz,
+            conf_threshold=args.conf_threshold,
+            illustration_class_keywords=args.illustration_class_keywords,
         )
         record["detected_classes"] = detected
         record["illustration_detection_count"] = illustration_detection_count
         record["max_confidence"] = illustration_max_confidence if has_illustration else None
+        record["downloaded_width"] = image_width
+        record["downloaded_height"] = image_height
 
         # 3a. Illustration detected -> upload, then delete local copy.
         if has_illustration:
@@ -1316,25 +1510,35 @@ def process_page(
 
             record["blob_name"] = blob_name
 
-        # 3b. No illustration -> normally delete local copy, nothing uploaded,
-        # except for a small random slice kept as a negative QC audit
-        # sample (uploaded, not just left on disk, so review doesn't
-        # require re-running this whole pipeline).
-        elif args.negative_sample_rate > 0 and random.random() < args.negative_sample_rate:
-            blob_name = build_blob_name(
-                args.negative_audit_prefix, item_id, page_index
-            )
-
-            if not args.dry_run:
-                upload_image_to_blob(container_client, blob_name, tmp_path)
-                record["action"] = "deleted_no_illustration_audited"
-            else:
-                record["action"] = "deleted_no_illustration_audited_dry_run"
-
-            record["blob_name"] = blob_name
-
+        # 3b. No illustration -> normally delete local copy, nothing
+        # uploaded, except for a deterministically-sampled slice kept as a
+        # negative QC audit sample (uploaded, not just left on disk, so
+        # review doesn't require re-running this whole pipeline). The
+        # sample value is computed and recorded for EVERY negative page,
+        # not just ones that end up selected, so the sampling decision is
+        # independently verifiable later.
         else:
-            record["action"] = "deleted_no_illustration"
+            sample_value = negative_audit_sample_value(
+                SOURCE_NAME, item_id, page_identifier
+            )
+            is_selected = sample_value < args.negative_sample_rate
+            record["negative_audit_sample_value"] = round(sample_value, 8)
+            record["negative_audit_selected"] = is_selected
+
+            if is_selected:
+                blob_name = build_blob_name(
+                    args.negative_audit_prefix, item_id, page_index
+                )
+
+                if not args.dry_run:
+                    upload_image_to_blob(container_client, blob_name, tmp_path)
+                    record["action"] = "deleted_no_illustration_audited"
+                else:
+                    record["action"] = "deleted_no_illustration_audited_dry_run"
+
+                record["blob_name"] = blob_name
+            else:
+                record["action"] = "deleted_no_illustration"
 
     except Exception as exc:
         record["action"] = "error"
@@ -1352,6 +1556,7 @@ def log_skipped_edge_page(
     *,
     item_id: str,
     keyword: str,
+    manifest_url: str | None,
     page: dict[str, Any],
     page_index: int,
     log_path: Path,
@@ -1360,19 +1565,33 @@ def log_skipped_edge_page(
     Record a leading/trailing page of a long book WITHOUT downloading it or
     running YOLO - see --edge-skip-threshold/--edge-skip-count. The page's
     IIIF image URL and position are still written to page_log.jsonl so its
-    existence is never lost, it's just never classified.
+    existence is never lost, it's just never classified (so
+    downloaded_width/height and the negative-audit fields stay null - there
+    was no download and no detection to base them on).
     """
     record: dict[str, Any] = {
-        "bodleian_item_id": item_id,
+        "source": SOURCE_NAME,
+        "source_item_id": item_id,
+        "bodleian_item_id": item_id,  # kept for backward compatibility
         "keyword": keyword,
+        "manifest_url": manifest_url,
+        "canvas_id": page.get("id"),
+        "page_label": page.get("label"),
         "page_index": page_index,
         "page_number": page_index + 1,
+        "image_service_url": page.get("image_service"),
         "image_url": page.get("image_url"),
+        "source_width": page.get("canvas_width"),
+        "source_height": page.get("canvas_height"),
+        "downloaded_width": None,
+        "downloaded_height": None,
         "action": "skipped_edge_page",
         "blob_name": None,
         "detected_classes": [],
         "illustration_detection_count": 0,
         "max_confidence": None,
+        "negative_audit_selected": None,
+        "negative_audit_sample_value": None,
         "error": None,
     }
     append_log(log_path, record)
@@ -1561,6 +1780,7 @@ def process_book(
                 record = log_skipped_edge_page(
                     item_id=item_id,
                     keyword=keyword,
+                    manifest_url=manifest_url,
                     page=pages[page_index],
                     page_index=page_index,
                     log_path=log_path,
@@ -1574,6 +1794,7 @@ def process_book(
                     device=device,
                     item_id=item_id,
                     keyword=keyword,
+                    manifest_url=manifest_url,
                     page=pages[page_index],
                     page_index=page_index,
                     tmp_dir=tmp_dir,
@@ -1737,6 +1958,7 @@ def main() -> int:
     args.books_path = args.output_dir / "books.jsonl"
     log_path = args.output_dir / "page_log.jsonl"
     args.page_log_path = log_path
+    args.run_metadata_path = args.output_dir / "run_metadata.json"
     args.last_state_upload_time = 0.0
 
     device = resolve_device(args.device, args.allow_cpu)
@@ -1747,6 +1969,12 @@ def main() -> int:
     except Exception as exc:
         print(f"Failed to load YOLO model: {exc}", file=sys.stderr)
         return 1
+
+    run_metadata = load_or_create_run_metadata(args.run_metadata_path, args, model, device)
+    print(
+        f"Run metadata: {args.run_metadata_path} "
+        f"(yolo_model_sha256={run_metadata.get('yolo_model_sha256')})"
+    )
 
     container_client = None
     if not args.dry_run:
@@ -1887,6 +2115,7 @@ def main() -> int:
     print(f"State file: {args.state_path}")
     print(f"Books metadata: {args.books_path}")
     print(f"Page log: {log_path}")
+    print(f"Run metadata: {args.run_metadata_path}")
     print(f"Azure state backup: {args.state_azure_prefix} (skipped in dry-run mode)")
 
     return 0

@@ -314,7 +314,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--azure-prefix",
-        default="",
+        default="botany",
         help="Optional blob name prefix, e.g. 'botany/'.",
     )
     parser.add_argument(
