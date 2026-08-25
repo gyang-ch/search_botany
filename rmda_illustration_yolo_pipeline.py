@@ -1,35 +1,38 @@
 #!/usr/bin/env python3
 """
-ndl_illustration_yolo_pipeline.py
+rmda_illustration_yolo_pipeline.py
 
-Large-scale National Diet Library (Japan) Digital Collections book-page
-harvesting with GPU YOLO triage, searching for pages with RICH
+Large-scale Kyoto University Rare Materials Digital Archive (RMDA)
+book-page harvesting with GPU YOLO triage, searching for pages with RICH
 ILLUSTRATION. Sibling script to bodleian_illustration_yolo_pipeline.py,
 gallica_illustration_yolo_pipeline.py, mdz_illustration_yolo_pipeline.py,
-and wellcome_illustration_yolo_pipeline.py - same one-page-at-a-time GPU
-triage, Azure upload strategy, and page_layout_best_new.pt model, pointed
-at NDL Search's SRU API + NDL Digital Collections' IIIF API instead.
+wellcome_illustration_yolo_pipeline.py, and ndl_illustration_yolo_pipeline.py
+- same one-page-at-a-time GPU triage, Azure upload strategy, and
+page_layout_best_new.pt model, pointed at RMDA's search results pages +
+IIIF API instead. Uses the exact same DEFAULT_KEYWORDS list as
+ndl_illustration_yolo_pipeline.py (Japanese/Sino-Japanese terms), per user
+instruction.
 
 IMPORTANT - keeping this separate from the other pipelines' data
 --------------------------------------------------------------------------
-NDL Digital Collections items are identified by a purely numeric
-Persistent ID (e.g. "2536504", from info:ndljp/pid/2536504) - a distinct
-namespace from every other library this project searches, so there's no
-risk of a literal blob-name collision. Even so, this script follows the
-exact same "<task>/<library>" file management plan laid out in
+RMDA item ids look like "RB00000001" (an "RB" prefix + zero-padded number)
+- a distinct namespace from every other library this project searches, so
+there's no risk of a literal blob-name collision. Even so, this script
+follows the exact same "<task>/<library>" file management plan laid out in
 bodleian_illustration_yolo_pipeline.py, so every library's illustration
 search lives in its own clearly labelled corner and nothing has to be
 cross-checked by hand later:
-  - --azure-prefix defaults to "illustrations/ndl" (siblings:
+  - --azure-prefix defaults to "illustrations/rmda" (siblings:
     "illustrations/bodleian_new", "illustrations/gallica",
-    "illustrations/mdz", "illustrations/wellcome"),
-  - --negative-audit-prefix defaults to "illustrations/ndl/negative_audit",
-  - --output-dir defaults to "ndl_illustration_yolo_run" (siblings:
+    "illustrations/mdz", "illustrations/wellcome", "illustrations/ndl"),
+  - --negative-audit-prefix defaults to "illustrations/rmda/negative_audit",
+  - --output-dir defaults to "rmda_illustration_yolo_run" (siblings:
     "bodleian_illustration_yolo_run", "gallica_illustration_yolo_run",
-    "mdz_illustration_yolo_run", "wellcome_illustration_yolo_run"), so
-    local state/temp files never collide either,
+    "mdz_illustration_yolo_run", "wellcome_illustration_yolo_run",
+    "ndl_illustration_yolo_run"), so local state/temp files never collide
+    either,
   - --state-azure-prefix defaults to
-    "state_backups/illustration_runs/ndl_illustration_yolo_run", alongside
+    "state_backups/illustration_runs/rmda_illustration_yolo_run", alongside
     the other pipelines' own prefixes under the same "illustration_runs/"
     umbrella.
 Because the output directories, Azure prefixes, and local temp/tmux
@@ -38,114 +41,98 @@ time as the other five illustration pipelines in their own tmux sessions
 on the same RunPod pod - see "Running all six illustration pipelines at
 once" below.
 
-API reference
--------------
-https://ndlsearch.ndl.go.jp/en/help/api/specifications
-https://ndlsearch.ndl.go.jp/file/help/api/specifications/ndlsearch_api_20240105.pdf
-    (the full "External Interface Specification" PDF linked from the page
-    above - the English help page itself is a client-rendered SPA with
-    very little of the actual parameter reference in static HTML, so this
-    PDF was the primary source for the details below)
-https://ndlsearch.ndl.go.jp/en/news/renkei_20240105
-https://dl.ndl.go.jp/static/files/IIIF_interface_En.pdf
+API reference - IMPORTANT CAVEAT: there isn't a documented one
+-------------------------------------------------------------------
+https://rmda.kulib.kyoto-u.ac.jp/en
+https://rmda.kulib.kyoto-u.ac.jp/en/reuse
+https://rmda.kulib.kyoto-u.ac.jp/news/2025-01-06
 
-Search endpoint (SRU, documented): GET https://ndlsearch.ndl.go.jp/api/sru
-    ?operation=searchRetrieve&version=1.2&recordSchema=dcndl
-    &recordPacking=xml&query=<CQL>&startRecord=<1-based>
-    &maximumRecords=<n>
-Response is XML (SRW searchRetrieveResponse). recordSchema=dcndl gives each
-matching bibliographic record as DC-NDL RDF/XML (dcndl:BibResource +
-dcndl:Item elements), confirmed live during development. A bibliographic
-record can bundle several dcndl:Item elements - e.g. one representing the
-physical holding at the National Diet Library itself (no online image) and
-another representing the SAME work's digitised copy in NDL Digital
-Collections (with an rdfs:seeAlso pointing at
-https://dl.ndl.go.jp/pid/<numeric>) - or even a copy digitised by a
-different, partner institution entirely (a seeAlso host other than
-dl.ndl.go.jp, which this pipeline can't do anything with since it isn't
-served by NDL's own IIIF API). parse_sru_records() below walks every
-dcndl:Item in every record, keeps only the ones with a dl.ndl.go.jp pid
-seeAlso, and de-duplicates by that pid - each pid becomes one independent
-"book" to process (a multi-volume work naturally yields one pid, and
-therefore one book entry, per volume). Because pid->manifest URL is
-deterministic (see below), and pid is the only thing this pipeline actually
-needs from the search result, no other SRU/dcndl field is parsed - exactly
-like the other four pipelines, book-level metadata is read from the IIIF
-manifest only (see extract_book_metadata below), never from the search
-result, so metadata extraction behaves identically whether a book is
-processed fresh or resumed via sweep_paused_books().
+Unlike every other pipeline in this project (Bodleian and Gallica have
+documented search APIs, MDZ's is at least a stable JSON endpoint behind the
+official site, Wellcome and NDL both have officially documented REST/SRU
+APIs), RMDA has NO documented search API of any kind - confirmed by reading
+its "en" landing page and reuse guide directly, neither of which mentions
+programmatic access. RMDA is a Drupal site (theme "kyoto_dc") whose search
+is a server-rendered Views/Solr results page - confirmed live during
+development that there is no JSON:API, OAI-PMH, or SRU endpoint (all
+returned 404). This pipeline therefore SCRAPES THE SEARCH RESULTS HTML
+directly:
+    GET https://rmda.kulib.kyoto-u.ac.jp/en/search?keys=<query>&page=<0-based>
+confirmed live: the query parameter is "keys" (the Drupal exposed-filter
+field name, NOT "q" - passing "q=" silently searches nothing and returns
+the whole unfiltered archive, a real trap encountered during development),
+results are paginated 40-per-page with no way to request more per page,
+and each result renders an `<a href="/item/<ID>">` link this pipeline
+regex-matches to collect item ids (see search_rmda_paginated() below); the
+"N - M of TOTAL" result-count text is parsed to know when to stop. THIS IS
+INHERENTLY MORE FRAGILE than every other pipeline in this project - a
+front-end template change on RMDA's side could silently break the item-id
+extraction with no error, just zero results. If this pipeline stops
+finding anything, check by hand first (visit
+https://rmda.kulib.kyoto-u.ac.jp/en/search?keys=<a keyword> in a browser)
+before assuming a keyword genuinely has no matches.
 
-mediatype filter and a CQL limitation (confirmed live)
----------------------------------------------------------
-Per user instruction, --mediatype-filter defaults to oldmaterials, books,
-and manuscripts (NDL's own mediaType vocabulary - "oldmaterials" covers
-NDL's famous pre-modern/rare-book collection, the most illustration-dense
-by far). The `mediatype` CQL field only supports the "=" operator (no
-front/partial match, no "any"/"all" shorthand - confirmed against the
-spec's own "SRU field conditions" table). Naively combining a keyword with
-an OR-group of mediatype values, e.g.
-`anywhere="X" and (mediatype=a or mediatype=b)`, looked like the obvious
-CQL - but confirmed LIVE during development that this NDL SRU endpoint
-supports NEITHER parenthesised grouping NOR mixing "and" and "or" in the
-same query at all (both return "illegal query syntax"; pure "and"-only or
-pure "or"-only queries both work fine on their own). There is therefore no
-single-request way to ask for "keyword AND (mediatype is one of these
-three)". This pipeline works around it by issuing one pure-"and" SRU query
-PER (keyword, mediatype value) COMBINATION - e.g. three separate queries
-for the three default mediatype values - and merging/de-duplicating the
-resulting pids client-side (see search_ndl_paginated()). Pass
---mediatype-filter with no values to search without any mediatype
-restriction (a single query per keyword, no "and mediatype=..." clause).
+IIIF manifest URL, however, IS a documented, stable, deterministic pattern
+(confirmed live, and referenced from every item page's embedded IIIF
+viewer links):
+    https://rmda.kulib.kyoto-u.ac.jp/iiif/metadata_manifest/{item_id}/manifest.json
+RMDA upgraded from IIIF Presentation API v2 to v3 in July 2024 (see the
+2025-01-06 news announcement above, which is RMDA reporting on the
+metadata-representation fallout of that upgrade) - confirmed live that
+manifests are now Presentation API v3 (top-level "items", not "sequences"),
+so parse_iiif_manifest() below (the same version-agnostic walk ported from
+the other five pipelines) takes the v3 branch here, unlike every sibling
+pipeline which has so far only ever seen Presentation v2 in practice.
+Confirmed live that canvas width/height are present directly (captured as
+canvas_width/canvas_height, same as the other pipelines), and that the
+Image API is IIIF Image API v3, profile level2 (full sizeByW support
+declared, unlike NDL's undeclared-but-working level1) - --iiif-width
+therefore works exactly like the other pipelines' equivalent flag. RMDA's
+own reuse guide documents a 2000px-per-side cap on served JPEGs, well above
+this pipeline's default width.
 
-Also confirmed live: maximumRecords is capped at 500, and - regardless of
-startRecord/maximumRecords - position 501 onward is simply unreachable
-("501件目以降を取得することはできない"). search_ndl_paginated() stops
-pagination at that ceiling per (keyword, mediatype) combination.
-
-IIIF manifest URL is deterministic from the pid:
-    https://www.dl.ndl.go.jp/api/iiif/{pid}/manifest.json
-Confirmed live that NDL manifests are IIIF Presentation API 2.x (top-level
-"sequences"/"canvases", canvas-level width/height present), structurally
-identical to the other four pipelines', so parse_iiif_manifest() below is
-the same version-agnostic walk ported from them, canvas_width/
-canvas_height included. The Image API's declared profile is level1 with
-only "regionByPct"/"sizeByWh" in its `supports` list (i.e. sizeByW -
-requesting a width alone with height auto-scaled - isn't officially
-declared) but confirmed live that a plain "/full/1200,/0/default.jpg"
-width-only request works anyway, so --iiif-width behaves exactly like the
-other pipelines' equivalent flag. NDL's own documented cap is 5000px on the
-longer side, comfortably above every default here.
-
-A manifest's "metadata" list uses plain string label/value pairs (like
-Bodleian/Gallica/Wellcome, NOT MDZ's multilingual shape), but MULTIPLE
-values for one label are "||"-delimited within a single value string
-(confirmed against the official IIIF spec PDF), a different convention
-again from Wellcome's "; "-delimited packing - see
-split_double_pipe_list() in extract_book_metadata() below. The manifest
-also carries an "Access Restrictions" metadata value (e.g. "PDM" for
-Public Domain Mark on openly viewable items; other values indicate
-narrower access, e.g. library-premises-only) - captured into books.jsonl,
-but not used to pre-filter search results; an inaccessible item's image
-requests will simply 403 and flow through the existing page-error/retry/
-failed_permanent handling like any other permanent HTTP error, the same
-graceful-degradation posture used throughout this pipeline family.
+A manifest's "metadata" list uses IIIF v3's native language-map shape -
+{"label": {"ja": ["..."]}, "value": {"ja": ["..."]}} - a fourth distinct
+multi-value convention in this project alongside Bodleian/Gallica's
+repeated-entry, Wellcome's "; "-packed, MDZ's list-of-{@language,@value},
+and NDL's "||"-packed forms - see language_map_values() in
+extract_book_metadata() below. Confirmed live against several manifests
+(including Siebold's "Flora Japonica" - RB00000001) that RMDA's own
+metadata list is sparse and consistent: just "タイトル / 著者"
+(title / author, combined in ONE value with a "/" separator inside an <a>
+tag), "レコードID" (record id, redundant with item_id), and "コレクション"
+(collection / holding body, e.g. "理学研究科所蔵" = held by the Graduate
+School of Science) - no separate date/publisher/subject fields are
+exposed. Title comes from the manifest's own top-level "label" (clean, no
+HTML); author is a best-effort split of the "タイトル / 著者" value on its
+last " / " (see extract_book_metadata()). requiredStatement (the holding
+institution statement, v3's replacement for v2's "attribution") and
+"rights" (a license-icon URL, e.g. ".../license_icon/free-license") are
+combined into rights_statement, same convention as the other pipelines.
+Per RMDA's own reuse guide, only images from certain libraries (Main
+Library, Yoshida-South, Faculty of Law, Graduate School of Economics,
+Graduate Schools of Science, and the Kyoto University Museum) are
+unconditionally free to reuse without application; others require
+contacting the holding library directly - the "collection" field carried
+into books.jsonl is the cue for which applies to a given item, so check it
+before reusing anything beyond research/thesis purposes.
 
 Default YOLO model
 -------------------
 Defaults to ./page_layout_best_new.pt (the same fine-tuned model as the
-other four illustration pipelines' default), classes:
+other five illustration pipelines' default), classes:
     illustration, text_block
 A page is treated as "contains a rich illustration" when any detected class
 name contains "illustration" (see --illustration-class-keywords).
 
 Workflow
 --------
-1. Search NDL for each keyword in KEYWORDS (Japanese/Sino-Japanese terms;
-   see module-level DEFAULT_KEYWORDS), once per --mediatype-filter value
-   (see "mediatype filter and a CQL limitation" above), merging/
-   de-duplicating pids across those sub-queries.
-2. For each pid, fetch its IIIF manifest (URL built deterministically) and
-   enumerate every page/canvas.
+1. Search RMDA for each keyword in KEYWORDS (Japanese/Sino-Japanese terms -
+   the exact same DEFAULT_KEYWORDS list as ndl_illustration_yolo_pipeline.py,
+   per user instruction) by scraping paginated search-results HTML (see API
+   reference above).
+2. For each item id, fetch its IIIF manifest (URL built deterministically)
+   and enumerate every page/canvas.
 3. Skip the whole item if it has fewer than --min-pages-per-book pages
    (default 5) - recorded as "skipped_too_short", never rechecked.
 4. Otherwise walk every page. If the book has MORE than
@@ -177,8 +164,8 @@ Workflow
    uploaded, and - for illustration-negative pages - whether the page was
    selected for the negative audit sample and the deterministic sampling
    value used.
-7. Book-level bibliographic metadata, the manifest's attribution/license/
-   access-restrictions, page counts, illustration-detection totals, and an
+7. Book-level bibliographic metadata, the manifest's rights/attribution,
+   collection, page counts, illustration-detection totals, and an
    illustration_density ratio are written to books.jsonl, one line per
    book.
 8. processed_items.json/books.jsonl/page_log.jsonl/run_metadata.json are
@@ -193,17 +180,19 @@ Workflow
    Python/PyTorch/Ultralytics/CUDA versions actually produced the corpus in
    that directory. See load_or_create_run_metadata().
 
-Be a good API citizen
-----------------------
-No API key or registration is required for SRU (registration is only
-suggested for continuous/production OpenSearch use, which this pipeline
-doesn't use). No numeric rate limit is documented for SRU. Even so, set
-NDL_CONTACT_EMAIL (see below) so the User-Agent identifies this research
-use, and keep --sleep at a reasonable default - the same posture the other
-pipelines' docs ask for. NDL Digital Collections content spans public
-domain, various openly-licensed, and access-restricted material; each book
-record in books.jsonl carries the manifest's attribution and Access
-Restrictions value so that provenance travels with the data.
+Be a good citizen (there is no API to be a citizen of - be a good guest)
+-----------------------------------------------------------------------------
+Because search here means scraping HTML meant for a browser (see above),
+this pipeline defaults to a MORE conservative --sleep than any of its
+siblings, and sets NDL_CONTACT_EMAIL-style identification (see
+RMDA_CONTACT_EMAIL below) purely so a User-Agent string identifies this as
+research traffic if anyone at Kyoto University ever looks at their access
+logs. RMDA's reuse guide provides a contact for image-reuse permission
+questions (gazo660@mail2.adm.kyoto-u.ac.jp) - worth an email before running
+this at real scale, since there is no public statement one way or the
+other about automated/bulk access. Each book record in books.jsonl carries
+the manifest's rights/attribution statement and collection so provenance -
+and which reuse terms apply - travels with the data.
 
 Environment
 -----------
@@ -211,7 +200,7 @@ Credentials are read from environment variables (never hardcode them in
 this file, since it goes to GitHub). Put them in a local `.env` (gitignored)
 or set them as RunPod pod environment variables / secrets.
 
-    NDL_CONTACT_EMAIL="you@example.org"   # optional but good practice
+    RMDA_CONTACT_EMAIL="you@example.org"   # optional but good practice
 
 Either:
     AZURE_STORAGE_CONNECTION_STRING="...."
@@ -280,22 +269,22 @@ same pod:
     tmux attach -t rmda_illustration
     tmux ls                                 # list all sessions
 
-All six scripts default --device to the same auto-detected cuda:0, so on
-a single-GPU pod they will share that one GPU's compute/VRAM - fine for a
-pod like an RTX A4000 (16GB) running six small YOLO models concurrently
+All six scripts default --device to the same auto-detected cuda:0, so on a
+single-GPU pod they will share that one GPU's compute/VRAM - fine for a pod
+like an RTX A4000 (16GB) running six small YOLO models concurrently
 (they'll interleave GPU time rather than truly run in parallel), but if you
-have a multi-GPU pod, pass --device cuda:1/cuda:2/cuda:3/cuda:4/cuda:5 to spread
-them out.
+have a multi-GPU pod, pass --device cuda:1/cuda:2/cuda:3/cuda:4/cuda:5 to
+spread them out.
 
 Example
 -------
-python ndl_illustration_yolo_pipeline.py \
+python rmda_illustration_yolo_pipeline.py \
     --azure-container botany-pages \
     --max-books-per-keyword 100 \
-    --output-dir ndl_illustration_yolo_run
+    --output-dir rmda_illustration_yolo_run
 
 Dry run (no Azure credentials needed, still deletes local files):
-python ndl_illustration_yolo_pipeline.py --dry-run --max-books-per-keyword 2
+python rmda_illustration_yolo_pipeline.py --dry-run --max-books-per-keyword 2
 """
 
 from __future__ import annotations
@@ -309,7 +298,6 @@ import re
 import shutil
 import sys
 import time
-import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -324,35 +312,31 @@ try:
 except ImportError:
     pass
 
-NDL_SRU_URL = "https://ndlsearch.ndl.go.jp/api/sru"
-NDL_IIIF_BASE = "https://www.dl.ndl.go.jp/api/iiif"
-NDL_VIEWER_BASE = "https://dl.ndl.go.jp"
+RMDA_BASE = "https://rmda.kulib.kyoto-u.ac.jp"
+RMDA_SEARCH_URL = f"{RMDA_BASE}/en/search"
+RMDA_IIIF_MANIFEST_BASE = f"{RMDA_BASE}/iiif/metadata_manifest"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-SRW_NS = {"srw": "http://www.loc.gov/zing/srw/"}
-RDF_NS = {
-    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
-    "dcndl": "http://ndl.go.jp/dcndl/terms/",
-}
-RDF_RESOURCE_ATTR = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}resource"
-DL_NDL_PID_RE = re.compile(r"https?://dl\.ndl\.go\.jp/pid/(\d+)")
+ITEM_LINK_RE = re.compile(r'href="(?:/en)?/item/([A-Za-z0-9]+)"')
+RESULT_COUNT_RE = re.compile(r"([\d,]+)\s*-\s*([\d,]+)\s*of\s*([\d,]+)")
 
 # Generic source identifier used in page_log.jsonl/run_metadata.json so
 # records from different library pipelines can eventually be pooled and
 # distinguished by a single consistent field name.
-SOURCE_NAME = "ndl"
-SOURCE_DISPLAY_NAME = "National Diet Library Digital Collections (Japan)"
+SOURCE_NAME = "rmda"
+SOURCE_DISPLAY_NAME = "Kyoto University Rare Materials Digital Archive (RMDA)"
 
-_contact = os.environ.get("NDL_CONTACT_EMAIL", "").strip()
+_contact = os.environ.get("RMDA_CONTACT_EMAIL", "").strip()
 USER_AGENT = (
-    "Phyto-Vision-NDL-Illustration-YOLO-Pipeline/1.0 "
+    "Phyto-Vision-RMDA-Illustration-YOLO-Pipeline/1.0 "
     f"(research; contact: {_contact})"
     if _contact
-    else "Phyto-Vision-NDL-Illustration-YOLO-Pipeline/1.0 "
-    "(research; set NDL_CONTACT_EMAIL for a contact address)"
+    else "Phyto-Vision-RMDA-Illustration-YOLO-Pipeline/1.0 "
+    "(research; set RMDA_CONTACT_EMAIL for a contact address)"
 )
 
+# Same keyword list as ndl_illustration_yolo_pipeline.py, per user
+# instruction.
 DEFAULT_KEYWORDS = [
     # Explicit visual material
     "絵入",
@@ -396,28 +380,20 @@ DEFAULT_KEYWORDS = [
     "図案",
 ]
 
-# Per user instruction: restrict to NDL's "oldmaterials" (pre-modern/rare
-# books - the most illustration-dense collection by far), "books", and
-# "manuscripts" mediaType values by default. See module docstring's "CQL
-# limitation" section for why each value becomes its own SRU query rather
-# than one OR-combined query.
-DEFAULT_MEDIATYPE_FILTER = ["oldmaterials", "books", "manuscripts"]
-
 DEFAULT_YOLO_MODEL = str(SCRIPT_DIR / "page_layout_best_new.pt")
 DEFAULT_IMGSZ = 640
 DEFAULT_CONF_THRESHOLD = 0.30
 DEFAULT_ILLUSTRATION_CLASS_KEYWORDS = ["illustration"]
 
 DEFAULT_MAX_BOOKS_PER_KEYWORD = 100
-DEFAULT_ROWS_PER_PAGE = 200  # NDL SRU's own default; hard cap is 500.
-NDL_SRU_MAX_REACHABLE_POSITION = 500  # confirmed live, see module docstring.
+RMDA_RESULTS_PER_PAGE = 40  # fixed by RMDA's search results page, confirmed live.
 DEFAULT_TIMEOUT = 60
 DEFAULT_RETRIES = 5
 DEFAULT_MAX_PAGE_RETRIES = 5
 DEFAULT_MIN_PAGES_PER_BOOK = 5
 DEFAULT_EDGE_SKIP_THRESHOLD = 20
 DEFAULT_EDGE_SKIP_COUNT = 5
-DEFAULT_STATE_AZURE_PREFIX = "state_backups/illustration_runs/ndl_illustration_yolo_run"
+DEFAULT_STATE_AZURE_PREFIX = "state_backups/illustration_runs/rmda_illustration_yolo_run"
 DEFAULT_STATE_UPLOAD_INTERVAL = 3000.0
 DEFAULT_IIIF_WIDTH = 1200
 DEFAULT_NEGATIVE_SAMPLE_RATE = 0.02
@@ -479,7 +455,7 @@ def validate_sas_write_permission(sas_url: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Search the National Diet Library (Japan) Digital Collections "
+            "Search the Kyoto University Rare Materials Digital Archive "
             "for illustration-rich books, triage every page with a GPU "
             "YOLO model, and stream illustration-positive pages to Azure "
             "Blob Storage."
@@ -490,31 +466,22 @@ def parse_args() -> argparse.Namespace:
         "--keywords",
         nargs="*",
         default=None,
-        help="Override the built-in (Japanese/Sino-Japanese) keyword list.",
-    )
-    parser.add_argument(
-        "--mediatype-filter",
-        nargs="*",
-        default=DEFAULT_MEDIATYPE_FILTER,
-        help="NDL mediatype values to restrict results to. Each value "
-        "becomes its own SRU query per keyword (see module docstring's "
-        "CQL-limitation note), merged/de-duplicated client-side. Pass "
-        "--mediatype-filter with no values to search without any "
-        f"mediatype restriction. Default: {DEFAULT_MEDIATYPE_FILTER}",
+        help="Override the built-in (Japanese/Sino-Japanese) keyword list "
+        "(same default list as ndl_illustration_yolo_pipeline.py).",
     )
     parser.add_argument(
         "--max-books-per-keyword",
         type=int,
         default=DEFAULT_MAX_BOOKS_PER_KEYWORD,
-        help="Maximum number of NDL search results (after merging across "
-        "--mediatype-filter values) to fetch per keyword.",
+        help="Maximum number of RMDA search results to fetch per keyword.",
     )
     parser.add_argument(
-        "--start-record",
+        "--start-page",
         type=int,
-        default=1,
-        help="SRU startRecord position to start from for each (keyword, "
-        "mediatype) query (1-based).",
+        default=0,
+        help="Search result page to start from for each keyword (0-based, "
+        f"{RMDA_RESULTS_PER_PAGE} results per page - matches RMDA's own "
+        "pagination).",
     )
     parser.add_argument(
         "--limit-pages-per-book",
@@ -551,7 +518,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("ndl_illustration_yolo_run"),
+        default=Path("rmda_illustration_yolo_run"),
         help="Directory for the state file, page log, run metadata, and the "
         "one-page-at-a-time temporary download. Kept distinct from the "
         "other pipelines' output dirs so local state never collides.",
@@ -616,9 +583,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--azure-prefix",
-        default="illustrations/ndl",
+        default="illustrations/rmda",
         help="Blob name prefix for kept page images. Defaults to "
-        "'illustrations/ndl' (NOT the container root), matching the "
+        "'illustrations/rmda' (NOT the container root), matching the "
         "'illustrations/<library>' layout the other illustration pipelines "
         "use, so libraries never collide even inside the same container.",
     )
@@ -636,9 +603,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--negative-audit-prefix",
-        default="illustrations/ndl/negative_audit",
+        default="illustrations/rmda/negative_audit",
         help="Blob prefix for the negative audit sample. Default: "
-        "illustrations/ndl/negative_audit",
+        "illustrations/rmda/negative_audit",
     )
     parser.add_argument(
         "--state-azure-prefix",
@@ -671,24 +638,23 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_IIIF_WIDTH,
         help="Requested IIIF image width in pixels (0 = full resolution, "
-        "capped by NDL at 5000px on the longer side regardless). Default: "
-        f"{DEFAULT_IIIF_WIDTH}.",
+        "capped by RMDA at 2000px on the longer side per its reuse guide). "
+        f"Default: {DEFAULT_IIIF_WIDTH}.",
     )
     parser.add_argument(
         "--timeout",
         type=int,
         default=DEFAULT_TIMEOUT,
-        help="HTTP timeout in seconds for NDL SRU/IIIF requests.",
+        help="HTTP timeout in seconds for RMDA search/IIIF requests.",
     )
     parser.add_argument(
         "--sleep",
         type=float,
-        default=0.5,
+        default=1.0,
         help="Delay after each successful search/manifest/image request. "
-        "No numeric rate limit is documented for NDL's SRU API, but this "
-        "is kept at a reasonable default out of courtesy - see module "
-        "docstring. Note that --mediatype-filter multiplies the number of "
-        "search requests per keyword (one per value).",
+        "Kept more conservative than this project's other pipelines since "
+        "RMDA has no documented API at all and search means scraping "
+        "browser-facing HTML - see module docstring.",
     )
     parser.add_argument(
         "--retries",
@@ -711,7 +677,7 @@ def parse_args() -> argparse.Namespace:
 
 
 # --------------------------------------------------------------------------
-# NDL SRU / IIIF helpers
+# RMDA search (HTML scrape) / IIIF helpers
 # --------------------------------------------------------------------------
 
 
@@ -720,7 +686,7 @@ def make_session() -> requests.Session:
     session.headers.update(
         {
             "User-Agent": USER_AGENT,
-            "Accept": "application/xml,image/jpeg,image/png,image/*,*/*;q=0.8",
+            "Accept": "text/html,application/json,image/jpeg,image/png,image/*,*/*;q=0.8",
         }
     )
     return session
@@ -732,35 +698,19 @@ def safe_id(value: str) -> str:
 
 
 def strip_html(value: str) -> str:
-    """Manifest metadata values are occasionally HTML fragments; collapse
-    to plain text."""
+    """Manifest metadata values are frequently HTML fragments (RMDA's
+    "タイトル / 著者" field wraps the title in <a><strong>...); collapse to
+    plain text."""
     text = re.sub(r"<[^>]+>", "", value)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
-
-
-def split_double_pipe_list(value: str | None) -> list[str]:
-    """
-    NDL IIIF manifest metadata packs multiple values for one label into a
-    single "||"-delimited string (confirmed against NDL's own IIIF
-    interface spec PDF) - a different convention from every other pipeline
-    in this project (Bodleian/Gallica repeat the {label, value} entry,
-    Wellcome uses "; ", MDZ uses a multilingual list). Splits back into a
-    clean list.
-    """
-    if not value:
-        return []
-    return [part.strip() for part in value.split("||") if part.strip()]
 
 
 def is_permanent_http_error(exc: Exception) -> bool:
     """
     True for 4xx responses the server used to deliberately refuse this exact
     request (403 Forbidden, 404 Not Found, ...) - retrying the same URL with
-    backoff has no realistic chance of succeeding and just burns time. This
-    also covers an access-restricted NDL item's image request (see module
-    docstring's "Access Restrictions" note): if that surfaces as a non-429
-    4xx, the page stops cleanly instead of retrying pointlessly.
+    backoff has no realistic chance of succeeding and just burns time.
 
     429 Too Many Requests is deliberately excluded even though it's a 4xx:
     it means "you're going too fast," which is the definition of transient -
@@ -830,189 +780,103 @@ def get_json_with_retry(
     raise RuntimeError("Unreachable JSON retry state.")
 
 
-def build_cql_query(keyword: str, mediatype: str | None) -> str:
+def parse_search_results_html(html: str) -> tuple[list[str], int | None]:
     """
-    Builds a pure-"and" CQL query - see module docstring's "CQL limitation"
-    section for why this pipeline never mixes "and"/"or" or uses
-    parentheses in one query. `anywhere` is NDL Search's simple/full-text
-    field (documented as matching the same fields as NDL Search's own
-    simple search box).
+    Extract item ids (in first-seen order, de-duplicated) and the total
+    result count from one RMDA search-results HTML page - see module
+    docstring's API-reference section for why this is a scrape rather than
+    a JSON API call. Returns (item_ids, total_count); total_count is None
+    if the "N - M of TOTAL" text couldn't be found (treated as "unknown,
+    keep paging until a page comes back empty").
     """
-    keyword = keyword.replace('"', "")
-    query = f'anywhere="{keyword}"'
-    if mediatype:
-        query = f"{query} and mediatype={mediatype}"
-    return query
-
-
-def parse_sru_records(root: ET.Element) -> list[str]:
-    """
-    Extract every dl.ndl.go.jp Persistent ID (pid) reachable from an SRU
-    searchRetrieveResponse's dcndl records - see module docstring for why
-    this is the ONLY thing pulled from the search response (book metadata
-    comes from the IIIF manifest instead). A single dcndl:BibResource can
-    carry several dcndl:Item elements; only ones with a
-    rdfs:seeAlso -> https://dl.ndl.go.jp/pid/<n> are usable by this
-    pipeline (an item digitised by a partner institution elsewhere, or with
-    no online copy at all, is skipped). De-duplicates within this one
-    response.
-    """
-    pids: list[str] = []
     seen: set[str] = set()
+    item_ids: list[str] = []
+    for match in ITEM_LINK_RE.finditer(html):
+        item_id = match.group(1).upper()
+        if item_id not in seen:
+            seen.add(item_id)
+            item_ids.append(item_id)
 
-    for record_el in root.findall("srw:records/srw:record", SRW_NS):
-        record_data = record_el.find("srw:recordData", SRW_NS)
-        if record_data is None:
-            continue
-        rdf_root = record_data.find("rdf:RDF", RDF_NS)
-        if rdf_root is None:
-            continue
+    total_count: int | None = None
+    count_match = RESULT_COUNT_RE.search(html)
+    if count_match:
+        try:
+            total_count = int(count_match.group(3).replace(",", ""))
+        except ValueError:
+            total_count = None
 
-        for item_el in rdf_root.findall("dcndl:Item", RDF_NS):
-            for see_also in item_el.findall("rdfs:seeAlso", RDF_NS):
-                resource = see_also.get(RDF_RESOURCE_ATTR)
-                if not resource:
-                    continue
-                match = DL_NDL_PID_RE.match(resource)
-                if match:
-                    pid = match.group(1)
-                    if pid not in seen:
-                        seen.add(pid)
-                        pids.append(pid)
-                    break
-
-    return pids
+    return item_ids, total_count
 
 
-def search_ndl_one_query(
+def search_rmda_paginated(
     session: requests.Session,
     keyword: str,
-    mediatype: str | None,
     max_results: int,
     timeout: int,
     sleep_seconds: float,
-    retries: int,
-    start_record: int,
-) -> list[str]:
+    retries: int = DEFAULT_RETRIES,
+    start_page: int = 0,
+) -> list[dict[str, Any]]:
     """
-    Pages through ONE (keyword, mediatype) SRU query - see
-    search_ndl_paginated() for how results across multiple mediatype
-    values get merged.
+    Pages through RMDA's search-results HTML (0-based `page`, fixed
+    RMDA_RESULTS_PER_PAGE per page - see module docstring). Stops once
+    max_results item ids are collected, a page yields no NEW item ids
+    (covers both "ran out of results" and "template changed and broke
+    parsing" - either way there's nothing useful left to do), or the parsed
+    total result count has been reached.
     """
-    pids: list[str] = []
+    item_ids: list[str] = []
     seen: set[str] = set()
-    record_pos = start_record
+    page = start_page
 
-    while len(pids) < max_results and record_pos <= NDL_SRU_MAX_REACHABLE_POSITION:
-        maximum_records = min(
-            DEFAULT_ROWS_PER_PAGE,
-            NDL_SRU_MAX_REACHABLE_POSITION - record_pos + 1,
-        )
-        params = {
-            "operation": "searchRetrieve",
-            "version": "1.2",
-            "recordSchema": "dcndl",
-            "recordPacking": "xml",
-            "query": build_cql_query(keyword, mediatype),
-            "startRecord": record_pos,
-            "maximumRecords": maximum_records,
-        }
+    while len(item_ids) < max_results:
+        params = {"keys": keyword, "page": page}
 
-        root: ET.Element | None = None
+        html: str | None = None
         delay = 2.0
 
         for attempt in range(retries):
             try:
-                response = session.get(NDL_SRU_URL, params=params, timeout=timeout)
+                response = session.get(RMDA_SEARCH_URL, params=params, timeout=timeout)
                 response.raise_for_status()
-                root = ET.fromstring(response.content)
+                html = response.text
                 break
             except Exception as exc:
                 if is_permanent_http_error(exc) or attempt == retries - 1:
                     print(
-                        f"[warn] search failed for keyword={keyword!r} "
-                        f"mediatype={mediatype!r} startRecord={record_pos}: {exc}"
+                        f"[warn] search failed for keyword={keyword!r} page={page}: {exc}"
                     )
                     break
                 time.sleep(retry_delay_seconds(exc, delay))
                 delay = min(delay * 2, 30.0)
 
-        if root is None:
+        if html is None:
             break
 
-        diagnostic = root.find("srw:diagnostics/srw:diagnostic", SRW_NS)
-        if diagnostic is not None:
-            message = diagnostic.findtext("srw:message", namespaces=SRW_NS)
-            print(
-                f"[warn] search returned a diagnostic for keyword={keyword!r} "
-                f"mediatype={mediatype!r}: {message}"
-            )
+        page_item_ids, total_count = parse_search_results_html(html)
+        new_ids = [item_id for item_id in page_item_ids if item_id not in seen]
+
+        if not new_ids:
             break
 
-        for pid in parse_sru_records(root):
-            if pid not in seen:
-                seen.add(pid)
-                pids.append(pid)
+        for item_id in new_ids:
+            seen.add(item_id)
+            item_ids.append(item_id)
 
         if sleep_seconds:
             time.sleep(sleep_seconds)
 
-        next_position_text = root.findtext("srw:nextRecordPosition", namespaces=SRW_NS)
-        try:
-            next_position = int(next_position_text) if next_position_text else 0
-        except ValueError:
-            next_position = 0
-
-        if next_position <= 0:
+        page += 1
+        already_fetched = (page - start_page) * RMDA_RESULTS_PER_PAGE
+        if total_count is not None and already_fetched >= total_count:
             break
-        record_pos = next_position
-
-    return pids[:max_results]
-
-
-def search_ndl_paginated(
-    session: requests.Session,
-    keyword: str,
-    mediatype_filter: list[str],
-    max_results: int,
-    timeout: int,
-    sleep_seconds: float,
-    retries: int = DEFAULT_RETRIES,
-    start_record: int = 1,
-) -> list[dict[str, Any]]:
-    """
-    Runs one SRU query per --mediatype-filter value (or a single
-    unrestricted query if the filter is empty - see module docstring's CQL
-    limitation note for why this can't be a single OR-combined query),
-    merges/de-duplicates the resulting pids, and returns them as result
-    dicts in the same shape the other pipelines' search functions use.
-    """
-    all_pids: list[str] = []
-    seen: set[str] = set()
-
-    mediatypes: list[str | None] = list(mediatype_filter) if mediatype_filter else [None]
-
-    for mediatype in mediatypes:
-        if len(all_pids) >= max_results:
-            break
-        pids = search_ndl_one_query(
-            session=session,
-            keyword=keyword,
-            mediatype=mediatype,
-            max_results=max_results - len(all_pids),
-            timeout=timeout,
-            sleep_seconds=sleep_seconds,
-            retries=retries,
-            start_record=start_record,
-        )
-        for pid in pids:
-            if pid not in seen:
-                seen.add(pid)
-                all_pids.append(pid)
 
     return [
-        {"item_id": pid, "manifest_url": f"{NDL_IIIF_BASE}/{pid}/manifest.json"}
-        for pid in all_pids[:max_results]
+        {
+            "item_id": item_id,
+            "manifest_url": f"{RMDA_IIIF_MANIFEST_BASE}/{item_id}/manifest.json",
+        }
+        for item_id in item_ids[:max_results]
     ]
 
 
@@ -1065,14 +929,15 @@ def image_service_from_body(body: Any) -> str | None:
 def parse_iiif_manifest(manifest: dict[str, Any], width: int) -> list[dict[str, Any]]:
     """
     IIIF-version-agnostic canvas/page walker (Presentation 2 and 3), ported
-    from the other four illustration pipelines. Confirmed live that NDL
-    manifests are Presentation 2 (top-level "sequences"), same shape as the
-    others', so this works unchanged apart from the `width` parameter. Each
-    returned page dict also carries canvas_width/canvas_height (the
-    canvas's own declared dimensions, i.e. the SOURCE image size per the
-    manifest - not necessarily what gets downloaded, see process_page's
-    downloaded_width/height) when the manifest provides them, which NDL's
-    do.
+    from the other five illustration pipelines. Confirmed live that RMDA
+    manifests are Presentation 3 (top-level "items", no "sequences") -
+    RMDA upgraded from v2 to v3 in July 2024 (see module docstring) - so
+    this is the first pipeline in the family to actually exercise the v3
+    branch in practice rather than just carry it defensively. Each returned
+    page dict also carries canvas_width/canvas_height (the canvas's own
+    declared dimensions, i.e. the SOURCE image size per the manifest - not
+    necessarily what gets downloaded, see process_page's downloaded_width/
+    height) when the manifest provides them, which RMDA's do.
     """
     size_segment = f"{width}," if width and width > 0 else "full"
     pages: list[dict[str, Any]] = []
@@ -1089,6 +954,8 @@ def parse_iiif_manifest(manifest: dict[str, Any], width: int) -> list[dict[str, 
                     next(iter(label.get("none", [])), None)
                     or next(iter(label.values()), f"Page {canvas_index + 1}")
                 )
+                if isinstance(label, list):
+                    label = label[0] if label else f"Page {canvas_index + 1}"
 
             service_base: str | None = None
             for annotation_page in canvas.get("items", []):
@@ -1159,52 +1026,76 @@ def parse_iiif_manifest(manifest: dict[str, Any], width: int) -> list[dict[str, 
     return pages
 
 
-# NDL manifest metadata label vocabulary, confirmed against NDL's own IIIF
-# interface spec PDF and a live manifest - see module docstring. No
-# "Subjects" label exists (same gap noted in the Gallica pipeline's
-# docstring).
+def language_map_values(value: Any, prefer_language: str = "ja") -> list[str]:
+    """
+    RMDA's IIIF v3 manifests use the native IIIF language-map shape for
+    label/value text - {"ja": ["..."], "en": ["..."]} - rather than any of
+    the other four pipelines' multi-value conventions (see module
+    docstring). Returns the string list for the preferred language, falling
+    back to English, then "none" (IIIF's own placeholder for
+    language-unspecified text), then whichever language happens to be
+    present first. Passes plain strings/lists through unchanged
+    (defensive, in case a field isn't a language map).
+    """
+    if isinstance(value, str):
+        return [value] if value else []
+
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, str)]
+
+    if isinstance(value, dict):
+        for lang in (prefer_language, "en", "none"):
+            texts = value.get(lang)
+            if isinstance(texts, list) and texts:
+                return [t for t in texts if isinstance(t, str)]
+        for texts in value.values():
+            if isinstance(texts, list):
+                found = [t for t in texts if isinstance(t, str)]
+                if found:
+                    return found
+
+    return []
+
+
+# RMDA manifest metadata label vocabulary (Japanese label text), confirmed
+# live against several manifests including Siebold's "Flora Japonica"
+# (RB00000001) - see module docstring. Sparse and consistent: no separate
+# date/publisher/subject labels are exposed.
 METADATA_LABELS = {
-    "date": ["Publication Date"],
-    "author": ["Creator"],
-    "publisher": ["Publisher"],
-    "series_title": ["Series Title"],
-    "isbn": ["ISBN"],
-    "call_number": ["Call Number"],
-    "bibliographic_id": ["Bibliographic ID"],
-    "doi": ["DOI"],
-    "access_restrictions": ["Access Restrictions"],
-    "notes": ["Notes", "Note"],
-    "source_url": ["Source (URL)"],
-    "viewer_url": ["URL"],
+    "title_author": ["タイトル / 著者"],
+    "record_id": ["レコードID"],
+    "collection": ["コレクション"],
 }
 
 
 def extract_book_metadata(manifest: dict[str, Any]) -> dict[str, Any]:
     """
     Best-effort bibliographic metadata extraction from a manifest's
-    top-level "metadata" list of {"label": ..., "value": ...} pairs, ported
-    from the Bodleian/Gallica/Wellcome pipelines (plain-string values), but
-    splitting "||"-packed multi-values (see split_double_pipe_list()).
-    Kept as manifest-only (not the SRU search response) so metadata
-    extraction behaves identically whether a book is processed fresh or
-    resumed via sweep_paused_books() - exactly like the other four
-    pipelines.
+    top-level "metadata" list of {"label": ..., "value": ...} language-map
+    pairs (see language_map_values()). Kept as manifest-only (not the
+    search-results HTML) so metadata extraction behaves identically whether
+    a book is processed fresh or resumed via sweep_paused_books() - exactly
+    like the other five pipelines.
+
+    RMDA packs title and author into ONE "タイトル / 著者" value as HTML
+    like `<a...><strong>Title</strong> / Author</a>` (confirmed live) rather
+    than exposing them as separate labels - title comes from the
+    manifest's own clean top-level "label" instead (see module docstring),
+    and author is recovered here as a best-effort split of the combined
+    field on its last " / " once HTML tags are stripped; a title with no
+    author portion (common for anonymous/no-author works) just yields
+    author=None.
     """
     by_label: dict[str, list[str]] = {}
     for entry in manifest.get("metadata", []) or []:
         if not isinstance(entry, dict):
             continue
-        label = entry.get("label")
-        value = entry.get("value")
-        if not isinstance(label, str):
+        label_texts = language_map_values(entry.get("label"))
+        label = label_texts[0] if label_texts else None
+        if not label:
             continue
 
-        values: list[str] = []
-        if isinstance(value, str):
-            values = split_double_pipe_list(value)
-        elif isinstance(value, list):
-            values = [v for v in value if isinstance(v, str)]
-
+        values = language_map_values(entry.get("value"))
         cleaned = [strip_html(v) for v in values if strip_html(v)]
         if cleaned:
             by_label.setdefault(label, []).extend(cleaned)
@@ -1216,41 +1107,31 @@ def extract_book_metadata(manifest: dict[str, Any]) -> dict[str, Any]:
                 return values[0]
         return None
 
-    def all_values(*keys: str) -> list[str]:
-        found: list[str] = []
-        for key in keys:
-            found.extend(by_label.get(key, []))
-        return found
+    title = strip_html(
+        " ".join(language_map_values(manifest.get("label")))
+    ) or None
 
-    title = first("Title") or strip_html(str(manifest.get("label") or "")) or None
-    attribution = strip_html(str(manifest.get("attribution") or "")) or None
-    access_restrictions = first(*METADATA_LABELS["access_restrictions"])
-    rights_statement = (
-        " | ".join(
-            p
-            for p in (
-                attribution,
-                f"Access Restrictions: {access_restrictions}" if access_restrictions else None,
-            )
-            if p
-        )
-        or None
-    )
+    title_author_raw = first(*METADATA_LABELS["title_author"])
+    author: str | None = None
+    if title_author_raw and " / " in title_author_raw:
+        _, _, author_part = title_author_raw.rpartition(" / ")
+        author = author_part.strip() or None
+
+    required_statement = manifest.get("requiredStatement")
+    attribution: str | None = None
+    if isinstance(required_statement, dict):
+        attribution_values = language_map_values(required_statement.get("value"))
+        attribution = strip_html(" ".join(attribution_values)) or None
+
+    rights = manifest.get("rights")
+    rights_url = rights if isinstance(rights, str) and rights else None
+    rights_statement = " | ".join(p for p in (attribution, rights_url) if p) or None
 
     return {
         "title": title,
-        "author": ", ".join(all_values(*METADATA_LABELS["author"])) or None,
-        "date": first(*METADATA_LABELS["date"]),
-        "publisher": first(*METADATA_LABELS["publisher"]),
-        "series_title": first(*METADATA_LABELS["series_title"]),
-        "isbn": first(*METADATA_LABELS["isbn"]),
-        "call_number": first(*METADATA_LABELS["call_number"]),
-        "bibliographic_id": first(*METADATA_LABELS["bibliographic_id"]),
-        "doi": first(*METADATA_LABELS["doi"]),
-        "access_restrictions": access_restrictions,
-        "notes": " ".join(all_values(*METADATA_LABELS["notes"])) or None,
-        "source_url": first(*METADATA_LABELS["source_url"]),
-        "viewer_url": first(*METADATA_LABELS["viewer_url"]),
+        "author": author,
+        "collection": first(*METADATA_LABELS["collection"]),
+        "record_id": first(*METADATA_LABELS["record_id"]),
         "rights_statement": rights_statement,
     }
 
@@ -1724,7 +1605,7 @@ def load_books(path: Path) -> dict[str, dict[str, Any]]:
             if not line:
                 continue
             record = json.loads(line)
-            item_id = record.get("ndl_item_id")
+            item_id = record.get("rmda_item_id")
             if item_id:
                 books[item_id] = record
 
@@ -1776,7 +1657,7 @@ def process_page(
         # in this project also write, so records can eventually be pooled.
         "source": SOURCE_NAME,
         "source_item_id": item_id,
-        "ndl_item_id": item_id,  # kept for backward compatibility
+        "rmda_item_id": item_id,  # kept for backward compatibility
         "keyword": keyword,
         "manifest_url": manifest_url,
         "canvas_id": page.get("id"),
@@ -1906,7 +1787,7 @@ def log_skipped_edge_page(
     record: dict[str, Any] = {
         "source": SOURCE_NAME,
         "source_item_id": item_id,
-        "ndl_item_id": item_id,  # kept for backward compatibility
+        "rmda_item_id": item_id,  # kept for backward compatibility
         "keyword": keyword,
         "manifest_url": manifest_url,
         "canvas_id": page.get("id"),
@@ -1947,7 +1828,7 @@ def process_book(
 ) -> None:
     item_id = extract_item_id(result)
     if not item_id:
-        print("[skip] could not determine NDL persistent ID from search result")
+        print("[skip] could not determine RMDA item id from search result")
         return
 
     item_state = state.get(item_id)
@@ -1975,21 +1856,12 @@ def process_book(
         current = state.get(item_id, {})
         pages_kept = current.get("pages_kept", 0)
         books[item_id] = {
-            "ndl_item_id": item_id,
-            "ndl_url": metadata.get("viewer_url")
-            or f"{NDL_VIEWER_BASE}/pid/{item_id}",
+            "rmda_item_id": item_id,
+            "rmda_url": f"{RMDA_BASE}/item/{item_id}",
             "manifest_url": manifest_url,
             "title": metadata.get("title"),
             "author": metadata.get("author"),
-            "date": metadata.get("date"),
-            "publisher": metadata.get("publisher"),
-            "series_title": metadata.get("series_title"),
-            "isbn": metadata.get("isbn"),
-            "call_number": metadata.get("call_number"),
-            "bibliographic_id": metadata.get("bibliographic_id"),
-            "doi": metadata.get("doi"),
-            "access_restrictions": metadata.get("access_restrictions"),
-            "notes": metadata.get("notes"),
+            "collection": metadata.get("collection"),
             "rights_statement": metadata.get("rights_statement"),
             "status": status,
             "total_pages": total_pages,
@@ -2238,17 +2110,18 @@ def sweep_paused_books(
     Resume every book currently paused ("in_progress") after a page-level
     error. A book only pauses because download_image_with_retry already
     exhausted its own backoff and still failed - the fix is elapsed
-    wall-clock time (transient NDL server issues tend to clear up), not
+    wall-clock time (transient RMDA server issues tend to clear up), not
     another immediate retry. Calling this between keyword searches (and
     once more at the end of the run) gives every paused book that gap
     naturally, instead of leaving it stuck until the same item happens to
     resurface under a later keyword's search results.
 
-    A resumed book's manifest URL is reconstructed from its pid rather than
-    replayed from the original search result (which isn't kept in state),
-    since NDL's manifest URL is a deterministic function of the pid - like
-    Gallica/MDZ, and unlike Wellcome (which needs a re-fetch since its
-    manifest URL isn't derivable from its catalogue id alone).
+    A resumed book's manifest URL is reconstructed from its item id rather
+    than replayed from the original search result (which isn't kept in
+    state), since RMDA's manifest URL is a deterministic function of the
+    item id - like Gallica/MDZ/NDL, and unlike Wellcome (which needs a
+    re-fetch since its manifest URL isn't derivable from its catalogue id
+    alone).
     """
     paused_ids = [
         item_id
@@ -2266,7 +2139,7 @@ def sweep_paused_books(
         keyword = keywords_matched[-1] if keywords_matched else "resume"
         result = {
             "item_id": item_id,
-            "manifest_url": f"{NDL_IIIF_BASE}/{item_id}/manifest.json",
+            "manifest_url": f"{RMDA_IIIF_MANIFEST_BASE}/{item_id}/manifest.json",
         }
 
         process_book(
@@ -2330,9 +2203,10 @@ def main() -> int:
 
     if not _contact:
         print(
-            "[warn] NDL_CONTACT_EMAIL is not set; the User-Agent sent to "
-            "NDL Search has no contact address. Good practice for any "
-            "harvest - consider setting it."
+            "[warn] RMDA_CONTACT_EMAIL is not set; the User-Agent sent to "
+            "RMDA has no contact address. Good practice for any harvest, "
+            "especially given RMDA has no documented API at all (see "
+            "module docstring) - consider setting it."
         )
 
     state = load_state(args.state_path)
@@ -2341,7 +2215,6 @@ def main() -> int:
 
     keywords = args.keywords or DEFAULT_KEYWORDS
     print(f"Keywords ({len(keywords)}): {', '.join(keywords)}")
-    print(f"Mediatype filter: {args.mediatype_filter or '(none - all mediatypes)'}")
     print(f"YOLO model: {args.yolo_model}")
     print(f"Illustration class keywords: {args.illustration_class_keywords}")
     print(f"Output dir: {args.output_dir}")
@@ -2356,15 +2229,14 @@ def main() -> int:
     for keyword in keywords:
         print(f"\n=== Keyword: {keyword!r} ===")
         try:
-            search_results = search_ndl_paginated(
+            search_results = search_rmda_paginated(
                 session=session,
                 keyword=keyword,
-                mediatype_filter=args.mediatype_filter,
                 max_results=args.max_books_per_keyword,
                 timeout=args.timeout,
                 sleep_seconds=args.sleep,
                 retries=args.retries,
-                start_record=args.start_record,
+                start_page=args.start_page,
             )
         except Exception as exc:
             print(f"[warn] search failed for {keyword!r}: {exc}")

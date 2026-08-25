@@ -32,8 +32,8 @@ cross-checked by hand later:
     umbrella.
 Because the output directories, Azure prefixes, and local temp/tmux
 concerns are all fully separate, this script is safe to run at the same
-time as the other four illustration pipelines in their own tmux sessions on
-the same RunPod pod - see "Running all five illustration pipelines at once"
+time as the other five illustration pipelines in their own tmux sessions on
+the same RunPod pod - see "Running all six illustration pipelines at once"
 below.
 
 API reference
@@ -215,11 +215,11 @@ pip install -r requirements.txt
 # https://pytorch.org/get-started/locally/ (see this project's notes on
 # picking a CUDA build that matches `nvidia-smi`'s reported CUDA Version).
 
-Running all five illustration pipelines at once
+Running all six illustration pipelines at once
 ----------------------------------------------------
-This script and the other four illustration pipelines write to fully
+This script and the other five illustration pipelines write to fully
 separate local directories and Azure prefixes (see "IMPORTANT" above), so
-it's safe to run all five concurrently in their own tmux sessions on the
+it's safe to run all six concurrently in their own tmux sessions on the
 same pod:
 
     tmux new -s bodleian_illustration
@@ -247,18 +247,24 @@ same pod:
     python ndl_illustration_yolo_pipeline.py
     # detach: Ctrl-b d
 
+    tmux new -s rmda_illustration
+    conda activate botany_yolo
+    python rmda_illustration_yolo_pipeline.py
+    # detach: Ctrl-b d
+
     tmux attach -t bodleian_illustration   # reattach to check on any of them
     tmux attach -t gallica_illustration
     tmux attach -t mdz_illustration
     tmux attach -t wellcome_illustration
     tmux attach -t ndl_illustration
+    tmux attach -t rmda_illustration
     tmux ls                                 # list all sessions
 
-All five scripts default --device to the same auto-detected cuda:0, so on a
+All six scripts default --device to the same auto-detected cuda:0, so on a
 single-GPU pod they will share that one GPU's compute/VRAM - fine for a pod
-like an RTX A4000 (16GB) running five small YOLO models concurrently
+like an RTX A4000 (16GB) running six small YOLO models concurrently
 (they'll interleave GPU time rather than truly run in parallel), but if you
-have a multi-GPU pod, pass --device cuda:1/cuda:2/cuda:3/cuda:4 to spread
+have a multi-GPU pod, pass --device cuda:1/cuda:2/cuda:3/cuda:4/cuda:5 to spread
 them out.
 
 Example
