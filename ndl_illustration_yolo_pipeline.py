@@ -1,36 +1,37 @@
 #!/usr/bin/env python3
 """
-wellcome_illustration_yolo_pipeline.py
+ndl_illustration_yolo_pipeline.py
 
-Large-scale Wellcome Collection book-page harvesting with GPU YOLO triage,
-searching for pages with RICH ILLUSTRATION. Sibling script to
-bodleian_illustration_yolo_pipeline.py, gallica_illustration_yolo_pipeline.py,
-and mdz_illustration_yolo_pipeline.py - same one-page-at-a-time GPU triage,
-Azure upload strategy, and page_layout_best_new.pt model, pointed at the
-Wellcome Collection's Catalogue + IIIF APIs instead.
+Large-scale National Diet Library (Japan) Digital Collections book-page
+harvesting with GPU YOLO triage, searching for pages with RICH
+ILLUSTRATION. Sibling script to bodleian_illustration_yolo_pipeline.py,
+gallica_illustration_yolo_pipeline.py, mdz_illustration_yolo_pipeline.py,
+and wellcome_illustration_yolo_pipeline.py - same one-page-at-a-time GPU
+triage, Azure upload strategy, and page_layout_best_new.pt model, pointed
+at NDL Search's SRU API + NDL Digital Collections' IIIF API instead.
 
 IMPORTANT - keeping this separate from the other pipelines' data
 --------------------------------------------------------------------------
-Wellcome catalogue work ids look like "f8ubg7fa" (8-char alphanumeric) - a
-distinct namespace from every other library this project searches, so
-there's no risk of a literal blob-name collision. Even so, this script
-follows the exact same "<task>/<library>" file management plan laid out in
+NDL Digital Collections items are identified by a purely numeric
+Persistent ID (e.g. "2536504", from info:ndljp/pid/2536504) - a distinct
+namespace from every other library this project searches, so there's no
+risk of a literal blob-name collision. Even so, this script follows the
+exact same "<task>/<library>" file management plan laid out in
 bodleian_illustration_yolo_pipeline.py, so every library's illustration
 search lives in its own clearly labelled corner and nothing has to be
 cross-checked by hand later:
-  - --azure-prefix defaults to "illustrations/wellcome" (siblings:
+  - --azure-prefix defaults to "illustrations/ndl" (siblings:
     "illustrations/bodleian_new", "illustrations/gallica",
-    "illustrations/mdz", "illustrations/ndl"),
-  - --negative-audit-prefix defaults to
-    "illustrations/wellcome/negative_audit",
-  - --output-dir defaults to "wellcome_illustration_yolo_run" (siblings:
+    "illustrations/mdz", "illustrations/wellcome"),
+  - --negative-audit-prefix defaults to "illustrations/ndl/negative_audit",
+  - --output-dir defaults to "ndl_illustration_yolo_run" (siblings:
     "bodleian_illustration_yolo_run", "gallica_illustration_yolo_run",
-    "mdz_illustration_yolo_run", "ndl_illustration_yolo_run"), so local
-    state/temp files never collide either,
+    "mdz_illustration_yolo_run", "wellcome_illustration_yolo_run"), so
+    local state/temp files never collide either,
   - --state-azure-prefix defaults to
-    "state_backups/illustration_runs/wellcome_illustration_yolo_run",
-    alongside the other pipelines' own prefixes under the same
-    "illustration_runs/" umbrella.
+    "state_backups/illustration_runs/ndl_illustration_yolo_run", alongside
+    the other pipelines' own prefixes under the same "illustration_runs/"
+    umbrella.
 Because the output directories, Azure prefixes, and local temp/tmux
 concerns are all fully separate, this script is safe to run at the same
 time as the other four illustration pipelines in their own tmux sessions
@@ -39,67 +40,112 @@ once" below.
 
 API reference
 -------------
-https://developers.wellcomecollection.org/docs/examples/connecting-the-apis-together
-https://developers.wellcomecollection.org/docs/api
+https://ndlsearch.ndl.go.jp/en/help/api/specifications
+https://ndlsearch.ndl.go.jp/file/help/api/specifications/ndlsearch_api_20240105.pdf
+    (the full "External Interface Specification" PDF linked from the page
+    above - the English help page itself is a client-rendered SPA with
+    very little of the actual parameter reference in static HTML, so this
+    PDF was the primary source for the details below)
+https://ndlsearch.ndl.go.jp/en/news/renkei_20240105
+https://dl.ndl.go.jp/static/files/IIIF_interface_En.pdf
 
-Unlike MDZ, the Wellcome Collection Catalogue API is an OFFICIALLY
-DOCUMENTED public REST API - no API key, no sign-up. Confirmed live during
-development:
+Search endpoint (SRU, documented): GET https://ndlsearch.ndl.go.jp/api/sru
+    ?operation=searchRetrieve&version=1.2&recordSchema=dcndl
+    &recordPacking=xml&query=<CQL>&startRecord=<1-based>
+    &maximumRecords=<n>
+Response is XML (SRW searchRetrieveResponse). recordSchema=dcndl gives each
+matching bibliographic record as DC-NDL RDF/XML (dcndl:BibResource +
+dcndl:Item elements), confirmed live during development. A bibliographic
+record can bundle several dcndl:Item elements - e.g. one representing the
+physical holding at the National Diet Library itself (no online image) and
+another representing the SAME work's digitised copy in NDL Digital
+Collections (with an rdfs:seeAlso pointing at
+https://dl.ndl.go.jp/pid/<numeric>) - or even a copy digitised by a
+different, partner institution entirely (a seeAlso host other than
+dl.ndl.go.jp, which this pipeline can't do anything with since it isn't
+served by NDL's own IIIF API). parse_sru_records() below walks every
+dcndl:Item in every record, keeps only the ones with a dl.ndl.go.jp pid
+seeAlso, and de-duplicates by that pid - each pid becomes one independent
+"book" to process (a multi-volume work naturally yields one pid, and
+therefore one book entry, per volume). Because pid->manifest URL is
+deterministic (see below), and pid is the only thing this pipeline actually
+needs from the search result, no other SRU/dcndl field is parsed - exactly
+like the other four pipelines, book-level metadata is read from the IIIF
+manifest only (see extract_book_metadata below), never from the search
+result, so metadata extraction behaves identically whether a book is
+processed fresh or resumed via sweep_paused_books().
 
-Search endpoint: GET https://api.wellcomecollection.org/catalogue/v2/works
-    ?query=<text>&page=<1-based>&pageSize=<1-100>
-    &items.locations.locationType=iiif-presentation
-    &include=items
-    [&workType=<comma-separated ids, ORed>]
-Response is JSON: {"totalPages": n, "totalResults": n, "results": [...]}.
-`items.locations.locationType=iiif-presentation` is passed on EVERY search
-(not user-toggleable) since this pipeline can only do anything with a
-digitised work; `include=items` is what makes each result carry its
-IIIF manifest URL directly (no separate per-item request needed - see
-manifest_url_from_result() below, same "manifest URL already in the search
-result" shape as the Bodleian pipeline, unlike Gallica/MDZ which build it
-deterministically from the item id). pageSize is capped server-side at 100
-(confirmed live via the API's own 400 error message). --work-type-filter
-(Wellcome "workType" facet, e.g. "a" = Books, "b" = Manuscripts,
-"h" = Archives and manuscripts, "k" = Pictures, "l" = Ephemera) defaults to
-EMPTY (no restriction), unlike the Gallica/MDZ pipelines' default
-book-only filter - confirmed live that a meaningful share of
-illustration-rich Wellcome material (loose plates, engravings, ephemera) is
-catalogued under non-Books work types, and the keyword list this pipeline
-ships with already leans on physical-form terms ("plates", "engravings",
-"woodcuts") that would be under-matched by a Books-only restriction; single
-/few-page items are still screened out by --min-pages-per-book regardless
-of work type.
+mediatype filter and a CQL limitation (confirmed live)
+---------------------------------------------------------
+Per user instruction, --mediatype-filter defaults to oldmaterials, books,
+and manuscripts (NDL's own mediaType vocabulary - "oldmaterials" covers
+NDL's famous pre-modern/rare-book collection, the most illustration-dense
+by far). The `mediatype` CQL field only supports the "=" operator (no
+front/partial match, no "any"/"all" shorthand - confirmed against the
+spec's own "SRU field conditions" table). Naively combining a keyword with
+an OR-group of mediatype values, e.g.
+`anywhere="X" and (mediatype=a or mediatype=b)`, looked like the obvious
+CQL - but confirmed LIVE during development that this NDL SRU endpoint
+supports NEITHER parenthesised grouping NOR mixing "and" and "or" in the
+same query at all (both return "illegal query syntax"; pure "and"-only or
+pure "or"-only queries both work fine on their own). There is therefore no
+single-request way to ask for "keyword AND (mediatype is one of these
+three)". This pipeline works around it by issuing one pure-"and" SRU query
+PER (keyword, mediatype value) COMBINATION - e.g. three separate queries
+for the three default mediatype values - and merging/de-duplicating the
+resulting pids client-side (see search_ndl_paginated()). Pass
+--mediatype-filter with no values to search without any mediatype
+restriction (a single query per keyword, no "and mediatype=..." clause).
 
-IIIF manifest URL comes directly from each search result (see above); no
-separate id->URL construction needed. Confirmed live that Wellcome
-manifests are IIIF Presentation API 2.x (top-level "sequences"/"canvases"),
-structurally identical to the other three pipelines', so
-parse_iiif_manifest() below is the same version-agnostic walk ported from
-them, canvas_width/canvas_height included. A manifest's "metadata" list
-uses plain string label/value pairs (like Bodleian/Gallica, NOT MDZ's
-multilingual shape), but several labels (confirmed live: "Subjects",
-"Contributors", "Type/technique") pack multiple values into ONE
-"; "-joined string rather than repeating the label - see
-split_semicolon_list() in extract_book_metadata() below. There is no
-"Title"/"Author" label in the metadata list; title comes from the
-manifest's own top-level "label", author from "Contributors" - see
-METADATA_LABELS.
+Also confirmed live: maximumRecords is capped at 500, and - regardless of
+startRecord/maximumRecords - position 501 onward is simply unreachable
+("501件目以降を取得することはできない"). search_ndl_paginated() stops
+pagination at that ceiling per (keyword, mediatype) combination.
+
+IIIF manifest URL is deterministic from the pid:
+    https://www.dl.ndl.go.jp/api/iiif/{pid}/manifest.json
+Confirmed live that NDL manifests are IIIF Presentation API 2.x (top-level
+"sequences"/"canvases", canvas-level width/height present), structurally
+identical to the other four pipelines', so parse_iiif_manifest() below is
+the same version-agnostic walk ported from them, canvas_width/
+canvas_height included. The Image API's declared profile is level1 with
+only "regionByPct"/"sizeByWh" in its `supports` list (i.e. sizeByW -
+requesting a width alone with height auto-scaled - isn't officially
+declared) but confirmed live that a plain "/full/1200,/0/default.jpg"
+width-only request works anyway, so --iiif-width behaves exactly like the
+other pipelines' equivalent flag. NDL's own documented cap is 5000px on the
+longer side, comfortably above every default here.
+
+A manifest's "metadata" list uses plain string label/value pairs (like
+Bodleian/Gallica/Wellcome, NOT MDZ's multilingual shape), but MULTIPLE
+values for one label are "||"-delimited within a single value string
+(confirmed against the official IIIF spec PDF), a different convention
+again from Wellcome's "; "-delimited packing - see
+split_double_pipe_list() in extract_book_metadata() below. The manifest
+also carries an "Access Restrictions" metadata value (e.g. "PDM" for
+Public Domain Mark on openly viewable items; other values indicate
+narrower access, e.g. library-premises-only) - captured into books.jsonl,
+but not used to pre-filter search results; an inaccessible item's image
+requests will simply 403 and flow through the existing page-error/retry/
+failed_permanent handling like any other permanent HTTP error, the same
+graceful-degradation posture used throughout this pipeline family.
 
 Default YOLO model
 -------------------
 Defaults to ./page_layout_best_new.pt (the same fine-tuned model as the
-other three illustration pipelines' default), classes:
+other four illustration pipelines' default), classes:
     illustration, text_block
 A page is treated as "contains a rich illustration" when any detected class
 name contains "illustration" (see --illustration-class-keywords).
 
 Workflow
 --------
-1. Search the Wellcome Collection for each keyword in KEYWORDS via the
-   search endpoint above.
-2. For each matching work, fetch its IIIF manifest (URL already present in
-   the search result) and enumerate every page/canvas.
+1. Search NDL for each keyword in KEYWORDS (Japanese/Sino-Japanese terms;
+   see module-level DEFAULT_KEYWORDS), once per --mediatype-filter value
+   (see "mediatype filter and a CQL limitation" above), merging/
+   de-duplicating pids across those sub-queries.
+2. For each pid, fetch its IIIF manifest (URL built deterministically) and
+   enumerate every page/canvas.
 3. Skip the whole item if it has fewer than --min-pages-per-book pages
    (default 5) - recorded as "skipped_too_short", never rechecked.
 4. Otherwise walk every page. If the book has MORE than
@@ -131,9 +177,10 @@ Workflow
    uploaded, and - for illustration-negative pages - whether the page was
    selected for the negative audit sample and the deterministic sampling
    value used.
-7. Book-level bibliographic metadata, the manifest's attribution/license,
-   page counts, illustration-detection totals, and an illustration_density
-   ratio are written to books.jsonl, one line per book.
+7. Book-level bibliographic metadata, the manifest's attribution/license/
+   access-restrictions, page counts, illustration-detection totals, and an
+   illustration_density ratio are written to books.jsonl, one line per
+   book.
 8. processed_items.json/books.jsonl/page_log.jsonl/run_metadata.json are
    ALSO pushed to Azure under --state-azure-prefix every
    --state-upload-interval seconds (and once more at the end of the run),
@@ -148,17 +195,15 @@ Workflow
 
 Be a good API citizen
 ----------------------
-No API key is required. Unlike MDZ, this IS a documented public API meant
-for exactly this kind of use, and no rate limit is documented (confirmed
-live: no X-RateLimit-* response headers on a test request). Even so, set
-WELLCOME_CONTACT_EMAIL (see below) so the User-Agent identifies this
-research use, keep --sleep at a reasonable default, and contact
-digital@wellcomecollection.org before a very large harvest as a courtesy -
-the same posture the other pipelines' docs ask for. Most Wellcome content
-is public domain or openly licensed (e.g. Public Domain Mark, CC-BY,
-"In copyright" for a minority); each book record in books.jsonl carries the
-manifest's attribution/rights statement so that provenance travels with the
-data.
+No API key or registration is required for SRU (registration is only
+suggested for continuous/production OpenSearch use, which this pipeline
+doesn't use). No numeric rate limit is documented for SRU. Even so, set
+NDL_CONTACT_EMAIL (see below) so the User-Agent identifies this research
+use, and keep --sleep at a reasonable default - the same posture the other
+pipelines' docs ask for. NDL Digital Collections content spans public
+domain, various openly-licensed, and access-restricted material; each book
+record in books.jsonl carries the manifest's attribution and Access
+Restrictions value so that provenance travels with the data.
 
 Environment
 -----------
@@ -166,7 +211,7 @@ Credentials are read from environment variables (never hardcode them in
 this file, since it goes to GitHub). Put them in a local `.env` (gitignored)
 or set them as RunPod pod environment variables / secrets.
 
-    WELLCOME_CONTACT_EMAIL="you@example.org"   # optional but good practice
+    NDL_CONTACT_EMAIL="you@example.org"   # optional but good practice
 
 Either:
     AZURE_STORAGE_CONNECTION_STRING="...."
@@ -229,22 +274,22 @@ same pod:
     tmux attach -t ndl_illustration
     tmux ls                                 # list all sessions
 
-All five scripts default --device to the same auto-detected cuda:0, so on a
-single-GPU pod they will share that one GPU's compute/VRAM - fine for a pod
-like an RTX A4000 (16GB) running five small YOLO models concurrently
+All five scripts default --device to the same auto-detected cuda:0, so on
+a single-GPU pod they will share that one GPU's compute/VRAM - fine for a
+pod like an RTX A4000 (16GB) running five small YOLO models concurrently
 (they'll interleave GPU time rather than truly run in parallel), but if you
 have a multi-GPU pod, pass --device cuda:1/cuda:2/cuda:3/cuda:4 to spread
 them out.
 
 Example
 -------
-python wellcome_illustration_yolo_pipeline.py \
+python ndl_illustration_yolo_pipeline.py \
     --azure-container botany-pages \
     --max-books-per-keyword 100 \
-    --output-dir wellcome_illustration_yolo_run
+    --output-dir ndl_illustration_yolo_run
 
 Dry run (no Azure credentials needed, still deletes local files):
-python wellcome_illustration_yolo_pipeline.py --dry-run --max-books-per-keyword 2
+python ndl_illustration_yolo_pipeline.py --dry-run --max-books-per-keyword 2
 """
 
 from __future__ import annotations
@@ -258,6 +303,7 @@ import re
 import shutil
 import sys
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -272,66 +318,84 @@ try:
 except ImportError:
     pass
 
-WELLCOME_API_BASE = "https://api.wellcomecollection.org/catalogue/v2"
-WELLCOME_WORKS_URL = f"{WELLCOME_API_BASE}/works"
-WELLCOME_SITE_BASE = "https://wellcomecollection.org"
+NDL_SRU_URL = "https://ndlsearch.ndl.go.jp/api/sru"
+NDL_IIIF_BASE = "https://www.dl.ndl.go.jp/api/iiif"
+NDL_VIEWER_BASE = "https://dl.ndl.go.jp"
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+SRW_NS = {"srw": "http://www.loc.gov/zing/srw/"}
+RDF_NS = {
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "dcndl": "http://ndl.go.jp/dcndl/terms/",
+}
+RDF_RESOURCE_ATTR = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}resource"
+DL_NDL_PID_RE = re.compile(r"https?://dl\.ndl\.go\.jp/pid/(\d+)")
 
 # Generic source identifier used in page_log.jsonl/run_metadata.json so
 # records from different library pipelines can eventually be pooled and
 # distinguished by a single consistent field name.
-SOURCE_NAME = "wellcome"
-SOURCE_DISPLAY_NAME = "Wellcome Collection"
+SOURCE_NAME = "ndl"
+SOURCE_DISPLAY_NAME = "National Diet Library Digital Collections (Japan)"
 
-_contact = os.environ.get("WELLCOME_CONTACT_EMAIL", "").strip()
+_contact = os.environ.get("NDL_CONTACT_EMAIL", "").strip()
 USER_AGENT = (
-    "Phyto-Vision-Wellcome-Illustration-YOLO-Pipeline/1.0 "
+    "Phyto-Vision-NDL-Illustration-YOLO-Pipeline/1.0 "
     f"(research; contact: {_contact})"
     if _contact
-    else "Phyto-Vision-Wellcome-Illustration-YOLO-Pipeline/1.0 "
-    "(research; set WELLCOME_CONTACT_EMAIL for a contact address)"
+    else "Phyto-Vision-NDL-Illustration-YOLO-Pipeline/1.0 "
+    "(research; set NDL_CONTACT_EMAIL for a contact address)"
 )
 
 DEFAULT_KEYWORDS = [
-    # Anatomy / human body
-    "anatomy",
-    "anatomical atlas",
-    "surgery",
-    "surgical anatomy",
-    "physiology",
-    "pathology",
-    "osteology",
-    "dermatology",
-    "obstetrics",
-    "midwifery",
-    # Illustration / book-form indicators
-    "illustrated",
-    "illustrations",
-    "plates",
-    "engravings",
-    "woodcuts",
-    "atlas",
-    # Plants / medicines / natural history
-    "botany",
-    "medical botany",
-    "herbal",
-    "materia medica",
-    "medicinal plants",
-    "pharmacy",
-    "pharmacopoeia",
-    "natural history",
-    "zoology",
-    # Scientific / medical visual material
-    "microscopy",
-    "medical instruments",
-    "surgical instruments",
-    "diseases",
-    "physiognomy",
+    # Explicit visual material
+    "絵入",
+    "絵入り",
+    "図入",
+    "図入り",
+    "図譜",
+    "図会",
+    "図説",
+    "画譜",
+    "絵本",
+    "画本",
+    # Natural history / medicine
+    "本草",
+    "本草図譜",
+    "博物",
+    "博物学",
+    "植物",
+    "動物",
+    "鳥類",
+    "魚類",
+    "虫",
+    "薬草",
+    "医学",
+    "解剖",
+    # Geography
+    "地図",
+    "絵図",
+    "名所図会",
+    "地誌",
+    # Technical/scientific
+    "天文",
+    "暦",
+    "機巧",
+    "器械",
+    "算法",
+    # Visual culture
+    "浮世絵",
+    "妖怪",
+    "紋様",
+    "図案",
 ]
 
-# No work-type restriction by default - see module docstring. Pass e.g.
-# --work-type-filter a b to restrict to Books + Manuscripts.
-DEFAULT_WORK_TYPE_FILTER: list[str] = []
+# Per user instruction: restrict to NDL's "oldmaterials" (pre-modern/rare
+# books - the most illustration-dense collection by far), "books", and
+# "manuscripts" mediaType values by default. See module docstring's "CQL
+# limitation" section for why each value becomes its own SRU query rather
+# than one OR-combined query.
+DEFAULT_MEDIATYPE_FILTER = ["oldmaterials", "books", "manuscripts"]
 
 DEFAULT_YOLO_MODEL = str(SCRIPT_DIR / "page_layout_best_new.pt")
 DEFAULT_IMGSZ = 640
@@ -339,14 +403,15 @@ DEFAULT_CONF_THRESHOLD = 0.30
 DEFAULT_ILLUSTRATION_CLASS_KEYWORDS = ["illustration"]
 
 DEFAULT_MAX_BOOKS_PER_KEYWORD = 100
-DEFAULT_ROWS_PER_PAGE = 100  # Wellcome caps pageSize at 100 server-side.
+DEFAULT_ROWS_PER_PAGE = 200  # NDL SRU's own default; hard cap is 500.
+NDL_SRU_MAX_REACHABLE_POSITION = 500  # confirmed live, see module docstring.
 DEFAULT_TIMEOUT = 60
 DEFAULT_RETRIES = 5
 DEFAULT_MAX_PAGE_RETRIES = 5
 DEFAULT_MIN_PAGES_PER_BOOK = 5
 DEFAULT_EDGE_SKIP_THRESHOLD = 20
 DEFAULT_EDGE_SKIP_COUNT = 5
-DEFAULT_STATE_AZURE_PREFIX = "state_backups/illustration_runs/wellcome_illustration_yolo_run"
+DEFAULT_STATE_AZURE_PREFIX = "state_backups/illustration_runs/ndl_illustration_yolo_run"
 DEFAULT_STATE_UPLOAD_INTERVAL = 3000.0
 DEFAULT_IIIF_WIDTH = 1200
 DEFAULT_NEGATIVE_SAMPLE_RATE = 0.02
@@ -408,9 +473,10 @@ def validate_sas_write_permission(sas_url: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Search the Wellcome Collection for illustration-rich books, "
-            "triage every page with a GPU YOLO model, and stream "
-            "illustration-positive pages to Azure Blob Storage."
+            "Search the National Diet Library (Japan) Digital Collections "
+            "for illustration-rich books, triage every page with a GPU "
+            "YOLO model, and stream illustration-positive pages to Azure "
+            "Blob Storage."
         )
     )
 
@@ -418,29 +484,31 @@ def parse_args() -> argparse.Namespace:
         "--keywords",
         nargs="*",
         default=None,
-        help="Override the built-in keyword list.",
+        help="Override the built-in (Japanese/Sino-Japanese) keyword list.",
     )
     parser.add_argument(
-        "--work-type-filter",
+        "--mediatype-filter",
         nargs="*",
-        default=DEFAULT_WORK_TYPE_FILTER,
-        help="Wellcome workType facet ids results are restricted to (ORed "
-        "together via a comma-separated filter value - confirmed live), "
-        "e.g. a b for Books + Manuscripts. Default: none (all work types) "
-        "- see module docstring for why.",
+        default=DEFAULT_MEDIATYPE_FILTER,
+        help="NDL mediatype values to restrict results to. Each value "
+        "becomes its own SRU query per keyword (see module docstring's "
+        "CQL-limitation note), merged/de-duplicated client-side. Pass "
+        "--mediatype-filter with no values to search without any "
+        f"mediatype restriction. Default: {DEFAULT_MEDIATYPE_FILTER}",
     )
     parser.add_argument(
         "--max-books-per-keyword",
         type=int,
         default=DEFAULT_MAX_BOOKS_PER_KEYWORD,
-        help="Maximum number of Wellcome search results to fetch per "
-        "keyword.",
+        help="Maximum number of NDL search results (after merging across "
+        "--mediatype-filter values) to fetch per keyword.",
     )
     parser.add_argument(
-        "--start-page",
+        "--start-record",
         type=int,
         default=1,
-        help="Search result page to start from for each keyword (1-based).",
+        help="SRU startRecord position to start from for each (keyword, "
+        "mediatype) query (1-based).",
     )
     parser.add_argument(
         "--limit-pages-per-book",
@@ -477,7 +545,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("wellcome_illustration_yolo_run"),
+        default=Path("ndl_illustration_yolo_run"),
         help="Directory for the state file, page log, run metadata, and the "
         "one-page-at-a-time temporary download. Kept distinct from the "
         "other pipelines' output dirs so local state never collides.",
@@ -542,9 +610,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--azure-prefix",
-        default="illustrations/wellcome",
+        default="illustrations/ndl",
         help="Blob name prefix for kept page images. Defaults to "
-        "'illustrations/wellcome' (NOT the container root), matching the "
+        "'illustrations/ndl' (NOT the container root), matching the "
         "'illustrations/<library>' layout the other illustration pipelines "
         "use, so libraries never collide even inside the same container.",
     )
@@ -562,9 +630,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--negative-audit-prefix",
-        default="illustrations/wellcome/negative_audit",
+        default="illustrations/ndl/negative_audit",
         help="Blob prefix for the negative audit sample. Default: "
-        "illustrations/wellcome/negative_audit",
+        "illustrations/ndl/negative_audit",
     )
     parser.add_argument(
         "--state-azure-prefix",
@@ -596,22 +664,25 @@ def parse_args() -> argparse.Namespace:
         "--iiif-width",
         type=int,
         default=DEFAULT_IIIF_WIDTH,
-        help="Requested IIIF image width in pixels (0 = full resolution). "
-        f"Default: {DEFAULT_IIIF_WIDTH}.",
+        help="Requested IIIF image width in pixels (0 = full resolution, "
+        "capped by NDL at 5000px on the longer side regardless). Default: "
+        f"{DEFAULT_IIIF_WIDTH}.",
     )
     parser.add_argument(
         "--timeout",
         type=int,
         default=DEFAULT_TIMEOUT,
-        help="HTTP timeout in seconds for Wellcome search/IIIF requests.",
+        help="HTTP timeout in seconds for NDL SRU/IIIF requests.",
     )
     parser.add_argument(
         "--sleep",
         type=float,
         default=0.5,
         help="Delay after each successful search/manifest/image request. "
-        "No rate limit is documented for Wellcome's API, but this is kept "
-        "at a reasonable default out of courtesy - see module docstring.",
+        "No numeric rate limit is documented for NDL's SRU API, but this "
+        "is kept at a reasonable default out of courtesy - see module "
+        "docstring. Note that --mediatype-filter multiplies the number of "
+        "search requests per keyword (one per value).",
     )
     parser.add_argument(
         "--retries",
@@ -634,7 +705,7 @@ def parse_args() -> argparse.Namespace:
 
 
 # --------------------------------------------------------------------------
-# Wellcome Collection search / IIIF helpers
+# NDL SRU / IIIF helpers
 # --------------------------------------------------------------------------
 
 
@@ -643,7 +714,7 @@ def make_session() -> requests.Session:
     session.headers.update(
         {
             "User-Agent": USER_AGENT,
-            "Accept": "application/json,image/jpeg,image/png,image/*,*/*;q=0.8",
+            "Accept": "application/xml,image/jpeg,image/png,image/*,*/*;q=0.8",
         }
     )
     return session
@@ -655,32 +726,35 @@ def safe_id(value: str) -> str:
 
 
 def strip_html(value: str) -> str:
-    """Manifest metadata values are sometimes HTML fragments (e.g. a
-    Repository value with an embedded logo <img>); collapse to plain
-    text."""
+    """Manifest metadata values are occasionally HTML fragments; collapse
+    to plain text."""
     text = re.sub(r"<[^>]+>", "", value)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
-def split_semicolon_list(value: str | None) -> list[str]:
+def split_double_pipe_list(value: str | None) -> list[str]:
     """
-    Several Wellcome manifest metadata labels (confirmed live: Subjects,
-    Contributors, Type/technique) pack multiple values into ONE "; "-joined
-    string rather than repeating the label, unlike Bodleian/Gallica where
-    each value gets its own {label, value} entry. Splits back into a clean
-    list, matching the other pipelines' books.jsonl field shape.
+    NDL IIIF manifest metadata packs multiple values for one label into a
+    single "||"-delimited string (confirmed against NDL's own IIIF
+    interface spec PDF) - a different convention from every other pipeline
+    in this project (Bodleian/Gallica repeat the {label, value} entry,
+    Wellcome uses "; ", MDZ uses a multilingual list). Splits back into a
+    clean list.
     """
     if not value:
         return []
-    return [part.strip() for part in value.split(";") if part.strip()]
+    return [part.strip() for part in value.split("||") if part.strip()]
 
 
 def is_permanent_http_error(exc: Exception) -> bool:
     """
     True for 4xx responses the server used to deliberately refuse this exact
     request (403 Forbidden, 404 Not Found, ...) - retrying the same URL with
-    backoff has no realistic chance of succeeding and just burns time.
+    backoff has no realistic chance of succeeding and just burns time. This
+    also covers an access-restricted NDL item's image request (see module
+    docstring's "Access Restrictions" note): if that surfaces as a non-429
+    4xx, the page stops cleanly instead of retrying pointlessly.
 
     429 Too Many Requests is deliberately excluded even though it's a 4xx:
     it means "you're going too fast," which is the definition of transient -
@@ -750,95 +824,200 @@ def get_json_with_retry(
     raise RuntimeError("Unreachable JSON retry state.")
 
 
-def search_wellcome_paginated(
+def build_cql_query(keyword: str, mediatype: str | None) -> str:
+    """
+    Builds a pure-"and" CQL query - see module docstring's "CQL limitation"
+    section for why this pipeline never mixes "and"/"or" or uses
+    parentheses in one query. `anywhere` is NDL Search's simple/full-text
+    field (documented as matching the same fields as NDL Search's own
+    simple search box).
+    """
+    keyword = keyword.replace('"', "")
+    query = f'anywhere="{keyword}"'
+    if mediatype:
+        query = f"{query} and mediatype={mediatype}"
+    return query
+
+
+def parse_sru_records(root: ET.Element) -> list[str]:
+    """
+    Extract every dl.ndl.go.jp Persistent ID (pid) reachable from an SRU
+    searchRetrieveResponse's dcndl records - see module docstring for why
+    this is the ONLY thing pulled from the search response (book metadata
+    comes from the IIIF manifest instead). A single dcndl:BibResource can
+    carry several dcndl:Item elements; only ones with a
+    rdfs:seeAlso -> https://dl.ndl.go.jp/pid/<n> are usable by this
+    pipeline (an item digitised by a partner institution elsewhere, or with
+    no online copy at all, is skipped). De-duplicates within this one
+    response.
+    """
+    pids: list[str] = []
+    seen: set[str] = set()
+
+    for record_el in root.findall("srw:records/srw:record", SRW_NS):
+        record_data = record_el.find("srw:recordData", SRW_NS)
+        if record_data is None:
+            continue
+        rdf_root = record_data.find("rdf:RDF", RDF_NS)
+        if rdf_root is None:
+            continue
+
+        for item_el in rdf_root.findall("dcndl:Item", RDF_NS):
+            for see_also in item_el.findall("rdfs:seeAlso", RDF_NS):
+                resource = see_also.get(RDF_RESOURCE_ATTR)
+                if not resource:
+                    continue
+                match = DL_NDL_PID_RE.match(resource)
+                if match:
+                    pid = match.group(1)
+                    if pid not in seen:
+                        seen.add(pid)
+                        pids.append(pid)
+                    break
+
+    return pids
+
+
+def search_ndl_one_query(
     session: requests.Session,
-    query: str,
-    work_type_filter: list[str],
+    keyword: str,
+    mediatype: str | None,
     max_results: int,
     timeout: int,
     sleep_seconds: float,
-    retries: int = DEFAULT_RETRIES,
-    start_page: int = 1,
-) -> list[dict[str, Any]]:
+    retries: int,
+    start_record: int,
+) -> list[str]:
     """
-    Page through the Wellcome Collection's documented /works search
-    endpoint. Always restricts to works with a IIIF presentation manifest
-    (items.locations.locationType=iiif-presentation) and includes items so
-    the manifest URL travels with each result - see module docstring.
+    Pages through ONE (keyword, mediatype) SRU query - see
+    search_ndl_paginated() for how results across multiple mediatype
+    values get merged.
     """
-    results: list[dict[str, Any]] = []
-    page = start_page
+    pids: list[str] = []
+    seen: set[str] = set()
+    record_pos = start_record
 
-    while len(results) < max_results:
-        params: dict[str, Any] = {
-            "query": query,
-            "page": page,
-            "pageSize": DEFAULT_ROWS_PER_PAGE,
-            "items.locations.locationType": "iiif-presentation",
-            "include": "items",
+    while len(pids) < max_results and record_pos <= NDL_SRU_MAX_REACHABLE_POSITION:
+        maximum_records = min(
+            DEFAULT_ROWS_PER_PAGE,
+            NDL_SRU_MAX_REACHABLE_POSITION - record_pos + 1,
+        )
+        params = {
+            "operation": "searchRetrieve",
+            "version": "1.2",
+            "recordSchema": "dcndl",
+            "recordPacking": "xml",
+            "query": build_cql_query(keyword, mediatype),
+            "startRecord": record_pos,
+            "maximumRecords": maximum_records,
         }
-        if work_type_filter:
-            params["workType"] = ",".join(work_type_filter)
 
-        data: dict[str, Any] | None = None
+        root: ET.Element | None = None
         delay = 2.0
 
         for attempt in range(retries):
             try:
-                response = session.get(WELLCOME_WORKS_URL, params=params, timeout=timeout)
+                response = session.get(NDL_SRU_URL, params=params, timeout=timeout)
                 response.raise_for_status()
-                data = response.json()
+                root = ET.fromstring(response.content)
                 break
             except Exception as exc:
                 if is_permanent_http_error(exc) or attempt == retries - 1:
                     print(
-                        f"[warn] search failed for query={query!r} page={page}: {exc}"
+                        f"[warn] search failed for keyword={keyword!r} "
+                        f"mediatype={mediatype!r} startRecord={record_pos}: {exc}"
                     )
                     break
                 time.sleep(retry_delay_seconds(exc, delay))
                 delay = min(delay * 2, 30.0)
 
-        if data is None:
+        if root is None:
             break
 
-        page_results = data.get("results", [])
-        if not isinstance(page_results, list) or not page_results:
+        diagnostic = root.find("srw:diagnostics/srw:diagnostic", SRW_NS)
+        if diagnostic is not None:
+            message = diagnostic.findtext("srw:message", namespaces=SRW_NS)
+            print(
+                f"[warn] search returned a diagnostic for keyword={keyword!r} "
+                f"mediatype={mediatype!r}: {message}"
+            )
             break
 
-        results.extend(page_results)
+        for pid in parse_sru_records(root):
+            if pid not in seen:
+                seen.add(pid)
+                pids.append(pid)
 
         if sleep_seconds:
             time.sleep(sleep_seconds)
 
-        total_pages = data.get("totalPages")
-        page += 1
-        if isinstance(total_pages, int) and page > total_pages:
-            break
+        next_position_text = root.findtext("srw:nextRecordPosition", namespaces=SRW_NS)
+        try:
+            next_position = int(next_position_text) if next_position_text else 0
+        except ValueError:
+            next_position = 0
 
-    return results[:max_results]
+        if next_position <= 0:
+            break
+        record_pos = next_position
+
+    return pids[:max_results]
+
+
+def search_ndl_paginated(
+    session: requests.Session,
+    keyword: str,
+    mediatype_filter: list[str],
+    max_results: int,
+    timeout: int,
+    sleep_seconds: float,
+    retries: int = DEFAULT_RETRIES,
+    start_record: int = 1,
+) -> list[dict[str, Any]]:
+    """
+    Runs one SRU query per --mediatype-filter value (or a single
+    unrestricted query if the filter is empty - see module docstring's CQL
+    limitation note for why this can't be a single OR-combined query),
+    merges/de-duplicates the resulting pids, and returns them as result
+    dicts in the same shape the other pipelines' search functions use.
+    """
+    all_pids: list[str] = []
+    seen: set[str] = set()
+
+    mediatypes: list[str | None] = list(mediatype_filter) if mediatype_filter else [None]
+
+    for mediatype in mediatypes:
+        if len(all_pids) >= max_results:
+            break
+        pids = search_ndl_one_query(
+            session=session,
+            keyword=keyword,
+            mediatype=mediatype,
+            max_results=max_results - len(all_pids),
+            timeout=timeout,
+            sleep_seconds=sleep_seconds,
+            retries=retries,
+            start_record=start_record,
+        )
+        for pid in pids:
+            if pid not in seen:
+                seen.add(pid)
+                all_pids.append(pid)
+
+    return [
+        {"item_id": pid, "manifest_url": f"{NDL_IIIF_BASE}/{pid}/manifest.json"}
+        for pid in all_pids[:max_results]
+    ]
 
 
 def extract_item_id(result: dict[str, Any]) -> str | None:
-    value = result.get("id")
+    value = result.get("item_id")
     return value if isinstance(value, str) and value else None
 
 
 def manifest_url_from_result(result: dict[str, Any]) -> str | None:
-    for item in result.get("items", []) or []:
-        if not isinstance(item, dict):
-            continue
-        for location in item.get("locations", []) or []:
-            if not isinstance(location, dict):
-                continue
-            location_type = location.get("locationType", {})
-            if (
-                isinstance(location_type, dict)
-                and location_type.get("id") == "iiif-presentation"
-            ):
-                url = location.get("url")
-                if isinstance(url, str) and url:
-                    return url
-    return None
+    value = result.get("manifest_url")
+    return value if isinstance(value, str) and value else None
 
 
 def service_to_base(service: Any) -> str | None:
@@ -880,14 +1059,14 @@ def image_service_from_body(body: Any) -> str | None:
 def parse_iiif_manifest(manifest: dict[str, Any], width: int) -> list[dict[str, Any]]:
     """
     IIIF-version-agnostic canvas/page walker (Presentation 2 and 3), ported
-    from the other three illustration pipelines. Confirmed live that
-    Wellcome manifests are Presentation 2 (top-level "sequences"), same
-    shape as the others', so this works unchanged apart from the `width`
-    parameter. Each returned page dict also carries canvas_width/
-    canvas_height (the canvas's own declared dimensions, i.e. the SOURCE
-    image size per the manifest - not necessarily what gets downloaded, see
-    process_page's downloaded_width/height) when the manifest provides
-    them, which Wellcome's do.
+    from the other four illustration pipelines. Confirmed live that NDL
+    manifests are Presentation 2 (top-level "sequences"), same shape as the
+    others', so this works unchanged apart from the `width` parameter. Each
+    returned page dict also carries canvas_width/canvas_height (the
+    canvas's own declared dimensions, i.e. the SOURCE image size per the
+    manifest - not necessarily what gets downloaded, see process_page's
+    downloaded_width/height) when the manifest provides them, which NDL's
+    do.
     """
     size_segment = f"{width}," if width and width > 0 else "full"
     pages: list[dict[str, Any]] = []
@@ -974,20 +1153,23 @@ def parse_iiif_manifest(manifest: dict[str, Any], width: int) -> list[dict[str, 
     return pages
 
 
-# Wellcome manifest metadata label vocabulary, confirmed live against real
-# manifests (including Gray's Anatomy, b24756866) - see module docstring.
-# No "Title"/"Author" label exists; title comes from the manifest's own
-# top-level "label", author from "Contributors".
+# NDL manifest metadata label vocabulary, confirmed against NDL's own IIIF
+# interface spec PDF and a live manifest - see module docstring. No
+# "Subjects" label exists (same gap noted in the Gallica pipeline's
+# docstring).
 METADATA_LABELS = {
-    "date": ["Publication/creation"],
-    "author": ["Contributors"],
-    "physical_description": ["Physical description"],
-    "type_technique": ["Type/technique"],
-    "subjects": ["Subjects"],
-    "notes": ["Notes"],
-    "attribution": ["Attribution"],
-    "conditions_of_use": ["Full conditions of use"],
-    "repository": ["Repository"],
+    "date": ["Publication Date"],
+    "author": ["Creator"],
+    "publisher": ["Publisher"],
+    "series_title": ["Series Title"],
+    "isbn": ["ISBN"],
+    "call_number": ["Call Number"],
+    "bibliographic_id": ["Bibliographic ID"],
+    "doi": ["DOI"],
+    "access_restrictions": ["Access Restrictions"],
+    "notes": ["Notes", "Note"],
+    "source_url": ["Source (URL)"],
+    "viewer_url": ["URL"],
 }
 
 
@@ -995,11 +1177,12 @@ def extract_book_metadata(manifest: dict[str, Any]) -> dict[str, Any]:
     """
     Best-effort bibliographic metadata extraction from a manifest's
     top-level "metadata" list of {"label": ..., "value": ...} pairs, ported
-    from the Bodleian/Gallica pipelines (plain-string values, unlike MDZ's
-    multilingual shape). Kept as manifest-only (not the richer search-result
-    document) so metadata extraction behaves identically whether a book is
-    processed fresh or resumed via sweep_paused_books() - exactly like the
-    other three pipelines.
+    from the Bodleian/Gallica/Wellcome pipelines (plain-string values), but
+    splitting "||"-packed multi-values (see split_double_pipe_list()).
+    Kept as manifest-only (not the SRU search response) so metadata
+    extraction behaves identically whether a book is processed fresh or
+    resumed via sweep_paused_books() - exactly like the other four
+    pipelines.
     """
     by_label: dict[str, list[str]] = {}
     for entry in manifest.get("metadata", []) or []:
@@ -1012,7 +1195,7 @@ def extract_book_metadata(manifest: dict[str, Any]) -> dict[str, Any]:
 
         values: list[str] = []
         if isinstance(value, str):
-            values = [value]
+            values = split_double_pipe_list(value)
         elif isinstance(value, list):
             values = [v for v in value if isinstance(v, str)]
 
@@ -1033,27 +1216,35 @@ def extract_book_metadata(manifest: dict[str, Any]) -> dict[str, Any]:
             found.extend(by_label.get(key, []))
         return found
 
-    attribution = first(*METADATA_LABELS["attribution"])
-    conditions = first(*METADATA_LABELS["conditions_of_use"])
-    rights_statement = " | ".join(p for p in (attribution, conditions) if p) or None
-
-    subjects: list[str] = []
-    for value in all_values(*METADATA_LABELS["subjects"]):
-        subjects.extend(split_semicolon_list(value))
-
-    authors: list[str] = []
-    for value in all_values(*METADATA_LABELS["author"]):
-        authors.extend(split_semicolon_list(value))
+    title = first("Title") or strip_html(str(manifest.get("label") or "")) or None
+    attribution = strip_html(str(manifest.get("attribution") or "")) or None
+    access_restrictions = first(*METADATA_LABELS["access_restrictions"])
+    rights_statement = (
+        " | ".join(
+            p
+            for p in (
+                attribution,
+                f"Access Restrictions: {access_restrictions}" if access_restrictions else None,
+            )
+            if p
+        )
+        or None
+    )
 
     return {
-        "title": strip_html(str(manifest.get("label") or "")) or None,
-        "author": ", ".join(authors) or None,
+        "title": title,
+        "author": ", ".join(all_values(*METADATA_LABELS["author"])) or None,
         "date": first(*METADATA_LABELS["date"]),
-        "physical_description": first(*METADATA_LABELS["physical_description"]),
-        "type_technique": all_values(*METADATA_LABELS["type_technique"]),
-        "subjects": subjects,
-        "notes": first(*METADATA_LABELS["notes"]),
-        "repository": first(*METADATA_LABELS["repository"]),
+        "publisher": first(*METADATA_LABELS["publisher"]),
+        "series_title": first(*METADATA_LABELS["series_title"]),
+        "isbn": first(*METADATA_LABELS["isbn"]),
+        "call_number": first(*METADATA_LABELS["call_number"]),
+        "bibliographic_id": first(*METADATA_LABELS["bibliographic_id"]),
+        "doi": first(*METADATA_LABELS["doi"]),
+        "access_restrictions": access_restrictions,
+        "notes": " ".join(all_values(*METADATA_LABELS["notes"])) or None,
+        "source_url": first(*METADATA_LABELS["source_url"]),
+        "viewer_url": first(*METADATA_LABELS["viewer_url"]),
         "rights_statement": rights_statement,
     }
 
@@ -1527,7 +1718,7 @@ def load_books(path: Path) -> dict[str, dict[str, Any]]:
             if not line:
                 continue
             record = json.loads(line)
-            item_id = record.get("wellcome_item_id")
+            item_id = record.get("ndl_item_id")
             if item_id:
                 books[item_id] = record
 
@@ -1579,7 +1770,7 @@ def process_page(
         # in this project also write, so records can eventually be pooled.
         "source": SOURCE_NAME,
         "source_item_id": item_id,
-        "wellcome_item_id": item_id,  # kept for backward compatibility
+        "ndl_item_id": item_id,  # kept for backward compatibility
         "keyword": keyword,
         "manifest_url": manifest_url,
         "canvas_id": page.get("id"),
@@ -1709,7 +1900,7 @@ def log_skipped_edge_page(
     record: dict[str, Any] = {
         "source": SOURCE_NAME,
         "source_item_id": item_id,
-        "wellcome_item_id": item_id,  # kept for backward compatibility
+        "ndl_item_id": item_id,  # kept for backward compatibility
         "keyword": keyword,
         "manifest_url": manifest_url,
         "canvas_id": page.get("id"),
@@ -1750,7 +1941,7 @@ def process_book(
 ) -> None:
     item_id = extract_item_id(result)
     if not item_id:
-        print("[skip] could not determine Wellcome item id from search result")
+        print("[skip] could not determine NDL persistent ID from search result")
         return
 
     item_state = state.get(item_id)
@@ -1778,17 +1969,21 @@ def process_book(
         current = state.get(item_id, {})
         pages_kept = current.get("pages_kept", 0)
         books[item_id] = {
-            "wellcome_item_id": item_id,
-            "wellcome_url": f"{WELLCOME_SITE_BASE}/works/{item_id}",
+            "ndl_item_id": item_id,
+            "ndl_url": metadata.get("viewer_url")
+            or f"{NDL_VIEWER_BASE}/pid/{item_id}",
             "manifest_url": manifest_url,
             "title": metadata.get("title"),
             "author": metadata.get("author"),
             "date": metadata.get("date"),
-            "subjects": metadata.get("subjects", []),
-            "physical_description": metadata.get("physical_description"),
-            "type_technique": metadata.get("type_technique", []),
+            "publisher": metadata.get("publisher"),
+            "series_title": metadata.get("series_title"),
+            "isbn": metadata.get("isbn"),
+            "call_number": metadata.get("call_number"),
+            "bibliographic_id": metadata.get("bibliographic_id"),
+            "doi": metadata.get("doi"),
+            "access_restrictions": metadata.get("access_restrictions"),
             "notes": metadata.get("notes"),
-            "repository": metadata.get("repository"),
             "rights_statement": metadata.get("rights_statement"),
             "status": status,
             "total_pages": total_pages,
@@ -1809,9 +2004,7 @@ def process_book(
 
     try:
         if not manifest_url:
-            raise RuntimeError(
-                "Search result had no usable IIIF presentation manifest URL."
-            )
+            raise RuntimeError("Search result had no IIIF manifest URL.")
 
         manifest_data = get_json_with_retry(
             session, manifest_url, args.timeout, args.sleep, args.retries
@@ -2039,19 +2232,17 @@ def sweep_paused_books(
     Resume every book currently paused ("in_progress") after a page-level
     error. A book only pauses because download_image_with_retry already
     exhausted its own backoff and still failed - the fix is elapsed
-    wall-clock time (transient Wellcome server issues tend to clear up),
-    not another immediate retry. Calling this between keyword searches (and
+    wall-clock time (transient NDL server issues tend to clear up), not
+    another immediate retry. Calling this between keyword searches (and
     once more at the end of the run) gives every paused book that gap
     naturally, instead of leaving it stuck until the same item happens to
     resurface under a later keyword's search results.
 
-    Unlike Gallica/MDZ, a resumed book's manifest URL can't be rebuilt
-    deterministically from its item id alone (Wellcome's manifest URL uses
-    a separate "b-number" only present in the original search result, not
-    the catalogue work id kept in state) - so this re-fetches the work
-    record from the Catalogue API's /works/{id} endpoint (with
-    include=items) to recover it, the one place this pipeline needs a
-    request beyond search+manifest+image.
+    A resumed book's manifest URL is reconstructed from its pid rather than
+    replayed from the original search result (which isn't kept in state),
+    since NDL's manifest URL is a deterministic function of the pid - like
+    Gallica/MDZ, and unlike Wellcome (which needs a re-fetch since its
+    manifest URL isn't derivable from its catalogue id alone).
     """
     paused_ids = [
         item_id
@@ -2067,19 +2258,10 @@ def sweep_paused_books(
     for item_id in paused_ids:
         keywords_matched = state.get(item_id, {}).get("keywords_matched") or []
         keyword = keywords_matched[-1] if keywords_matched else "resume"
-
-        try:
-            result = get_json_with_retry(
-                session,
-                f"{WELLCOME_WORKS_URL}/{item_id}",
-                args.timeout,
-                args.sleep,
-                args.retries,
-                params={"include": "items"},
-            )
-        except Exception as exc:
-            print(f"[warn] could not refetch work record for {item_id}: {exc}")
-            continue
+        result = {
+            "item_id": item_id,
+            "manifest_url": f"{NDL_IIIF_BASE}/{item_id}/manifest.json",
+        }
 
         process_book(
             result=result,
@@ -2142,10 +2324,9 @@ def main() -> int:
 
     if not _contact:
         print(
-            "[warn] WELLCOME_CONTACT_EMAIL is not set; the User-Agent sent "
-            "to Wellcome Collection has no contact address. Good practice "
-            "for any harvest - consider setting it, and coordinate with "
-            "digital@wellcomecollection.org for real scale."
+            "[warn] NDL_CONTACT_EMAIL is not set; the User-Agent sent to "
+            "NDL Search has no contact address. Good practice for any "
+            "harvest - consider setting it."
         )
 
     state = load_state(args.state_path)
@@ -2154,7 +2335,7 @@ def main() -> int:
 
     keywords = args.keywords or DEFAULT_KEYWORDS
     print(f"Keywords ({len(keywords)}): {', '.join(keywords)}")
-    print(f"Work type filter: {args.work_type_filter or '(none - all work types)'}")
+    print(f"Mediatype filter: {args.mediatype_filter or '(none - all mediatypes)'}")
     print(f"YOLO model: {args.yolo_model}")
     print(f"Illustration class keywords: {args.illustration_class_keywords}")
     print(f"Output dir: {args.output_dir}")
@@ -2169,15 +2350,15 @@ def main() -> int:
     for keyword in keywords:
         print(f"\n=== Keyword: {keyword!r} ===")
         try:
-            search_results = search_wellcome_paginated(
+            search_results = search_ndl_paginated(
                 session=session,
-                query=keyword,
-                work_type_filter=args.work_type_filter,
+                keyword=keyword,
+                mediatype_filter=args.mediatype_filter,
                 max_results=args.max_books_per_keyword,
                 timeout=args.timeout,
                 sleep_seconds=args.sleep,
                 retries=args.retries,
-                start_page=args.start_page,
+                start_record=args.start_record,
             )
         except Exception as exc:
             print(f"[warn] search failed for {keyword!r}: {exc}")

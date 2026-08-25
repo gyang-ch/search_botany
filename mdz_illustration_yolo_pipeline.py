@@ -19,19 +19,22 @@ bodleian_illustration_yolo_pipeline.py, so every library's illustration
 search lives in its own clearly labelled corner and nothing has to be
 cross-checked by hand later:
   - --azure-prefix defaults to "illustrations/mdz" (siblings:
-    "illustrations/bodleian_new", "illustrations/gallica"),
+    "illustrations/bodleian_new", "illustrations/gallica",
+    "illustrations/wellcome", "illustrations/ndl"),
   - --negative-audit-prefix defaults to "illustrations/mdz/negative_audit",
   - --output-dir defaults to "mdz_illustration_yolo_run" (siblings:
-    "bodleian_illustration_yolo_run", "gallica_illustration_yolo_run"), so
+    "bodleian_illustration_yolo_run", "gallica_illustration_yolo_run",
+    "wellcome_illustration_yolo_run", "ndl_illustration_yolo_run"), so
     local state/temp files never collide either,
   - --state-azure-prefix defaults to
     "state_backups/illustration_runs/mdz_illustration_yolo_run", alongside
-    the other two pipelines' own prefixes under the same
-    "illustration_runs/" umbrella.
+    the other pipelines' own prefixes under the same "illustration_runs/"
+    umbrella.
 Because the output directories, Azure prefixes, and local temp/tmux
 concerns are all fully separate, this script is safe to run at the same
-time as the other two illustration pipelines in their own tmux sessions on
-the same RunPod pod - see "Running all three pipelines at once" below.
+time as the other four illustration pipelines in their own tmux sessions on
+the same RunPod pod - see "Running all five illustration pipelines at once"
+below.
 
 API reference
 -------------
@@ -212,11 +215,11 @@ pip install -r requirements.txt
 # https://pytorch.org/get-started/locally/ (see this project's notes on
 # picking a CUDA build that matches `nvidia-smi`'s reported CUDA Version).
 
-Running all four illustration pipelines at once
+Running all five illustration pipelines at once
 ----------------------------------------------------
-This script and the other three illustration pipelines write to fully
+This script and the other four illustration pipelines write to fully
 separate local directories and Azure prefixes (see "IMPORTANT" above), so
-it's safe to run all four concurrently in their own tmux sessions on the
+it's safe to run all five concurrently in their own tmux sessions on the
 same pod:
 
     tmux new -s bodleian_illustration
@@ -239,18 +242,24 @@ same pod:
     python wellcome_illustration_yolo_pipeline.py
     # detach: Ctrl-b d
 
+    tmux new -s ndl_illustration
+    conda activate botany_yolo
+    python ndl_illustration_yolo_pipeline.py
+    # detach: Ctrl-b d
+
     tmux attach -t bodleian_illustration   # reattach to check on any of them
     tmux attach -t gallica_illustration
     tmux attach -t mdz_illustration
     tmux attach -t wellcome_illustration
+    tmux attach -t ndl_illustration
     tmux ls                                 # list all sessions
 
-All four scripts default --device to the same auto-detected cuda:0, so on a
+All five scripts default --device to the same auto-detected cuda:0, so on a
 single-GPU pod they will share that one GPU's compute/VRAM - fine for a pod
-like an RTX A4000 (16GB) running four small YOLO models concurrently
+like an RTX A4000 (16GB) running five small YOLO models concurrently
 (they'll interleave GPU time rather than truly run in parallel), but if you
-have a multi-GPU pod, pass --device cuda:1/cuda:2/cuda:3 to spread them
-out.
+have a multi-GPU pod, pass --device cuda:1/cuda:2/cuda:3/cuda:4 to spread
+them out.
 
 Example
 -------
