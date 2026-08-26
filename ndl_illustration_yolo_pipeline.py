@@ -414,6 +414,7 @@ NDL_SRU_MAX_REACHABLE_POSITION = 500  # confirmed live, see module docstring.
 DEFAULT_TIMEOUT = 60
 DEFAULT_RETRIES = 5
 DEFAULT_MAX_PAGE_RETRIES = 5
+DEFAULT_MAX_BOOK_RETRIES = 3
 DEFAULT_MIN_PAGES_PER_BOOK = 5
 DEFAULT_EDGE_SKIP_THRESHOLD = 20
 DEFAULT_EDGE_SKIP_COUNT = 5
@@ -705,6 +706,17 @@ def parse_args() -> argparse.Namespace:
         help="Maximum times a single page is retried across separate runs "
         "before its book is marked failed_permanent and skipped like a "
         f"completed book. Default: {DEFAULT_MAX_PAGE_RETRIES}",
+    )
+    parser.add_argument(
+        "--max-book-retries",
+        type=int,
+        default=DEFAULT_MAX_BOOK_RETRIES,
+        help="Maximum times a book-level failure (manifest couldn't be "
+        "fetched, no pages could be resolved, etc. - as opposed to a "
+        "page-level failure, see --max-page-retries) is retried across "
+        "separate runs before the book is marked failed_permanent and "
+        f"stops being re-discovered by future searches. Default: "
+        f"{DEFAULT_MAX_BOOK_RETRIES}",
     )
 
     return parser.parse_args()
@@ -1932,6 +1944,45 @@ def log_skipped_edge_page(
     return record
 
 
+def record_book_failure(
+    state: dict[str, Any],
+    item_id: str,
+    error: str,
+    keyword: str,
+    max_book_retries: int,
+) -> str:
+    """
+    Shared bookkeeping for a book-level failure - the manifest couldn't be
+    fetched, no pages could be resolved from it, or any other exception
+    happened before/instead of the per-page loop (as opposed to a
+    page-level failure, which pauses the book "in_progress" and is capped
+    by a separate mechanism - see --max-page-retries). Tracks
+    book_retry_count across separate runs the same way page-level retries
+    are tracked: once max_book_retries is reached, the book is marked
+    "failed_permanent" (a terminal status, like "completed") so it stops
+    being re-discovered and re-attempted on every future run. Without this
+    cap, a search result whose manifest is permanently missing or broken
+    on the source's end - seen in practice: a library's own catalog can
+    reference a "digitized" item whose manifest was never actually
+    published - would be retried forever, since a plain "failed" status is
+    NOT terminal. Returns the final status assigned, for logging.
+    """
+    previous = state.get(item_id) or {}
+    keywords_matched = set(previous.get("keywords_matched", []))
+    keywords_matched.add(keyword)
+    retry_count = previous.get("book_retry_count", 0) + 1
+    status = "failed_permanent" if retry_count >= max_book_retries else "failed"
+
+    state[item_id] = {
+        **previous,
+        "status": status,
+        "error": error,
+        "book_retry_count": retry_count,
+        "keywords_matched": sorted(keywords_matched),
+    }
+    return status
+
+
 def process_book(
     *,
     result: dict[str, Any],
@@ -2020,13 +2071,11 @@ def process_book(
 
         if not pages:
             print(f"[skip] {item_id}: no page images could be resolved")
-            state[item_id] = {
-                "status": "failed",
-                "error": "no page images found",
-                "keywords_matched": [keyword],
-            }
+            status = record_book_failure(
+                state, item_id, "no page images found", keyword, args.max_book_retries
+            )
             save_state_atomic(args.state_path, state)
-            flush_book_record("failed")
+            flush_book_record(status)
             return
 
         raw_total_pages = len(pages)
@@ -2210,17 +2259,14 @@ def process_book(
 
     except Exception as exc:
         print(f"[error] {item_id}: {exc}")
-        previous = state.get(item_id) or {}
-        keywords_matched = set(previous.get("keywords_matched", []))
-        keywords_matched.add(keyword)
-        state[item_id] = {
-            **previous,
-            "status": "failed",
-            "error": str(exc),
-            "keywords_matched": sorted(keywords_matched),
-        }
+        status = record_book_failure(state, item_id, str(exc), keyword, args.max_book_retries)
+        if status == "failed_permanent":
+            print(
+                f"[error] {item_id}: giving up after repeated book-level "
+                "failures (failed_permanent)"
+            )
         save_state_atomic(args.state_path, state)
-        flush_book_record("failed")
+        flush_book_record(status)
 
 
 def sweep_paused_books(
