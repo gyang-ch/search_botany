@@ -812,12 +812,20 @@ def search_loc_paginated(
     sleep_seconds: float,
     retries: int = DEFAULT_RETRIES,
     start_page: int = 1,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     """
     Ported from botany_pipelines/loc_yolo_pipeline.py's
     search_books_paginated(), with `collection` always applied (that
     script's --collection was optional; here it defaults to and should
     stay "chinese-rare-books" - see module docstring).
+
+    Returns (results, request_failed). request_failed is True if any page
+    fetch was abandoned due to a permanent HTTP error (e.g. the 403s LOC's
+    Cloudflare protection returns - see module docstring's "IMPORTANT
+    CAVEAT") rather than because results were genuinely exhausted -
+    main() uses this to tell "this keyword truly has no matches" apart
+    from "the request itself never got through" when deciding whether to
+    print the Cloudflare-block hint at the end of the run.
     """
     endpoint = (
         f"{LOC_BASE}/collections/{collection}/"
@@ -827,6 +835,7 @@ def search_loc_paginated(
 
     results: list[dict[str, Any]] = []
     sp = start_page
+    request_failed = False
 
     while len(results) < max_results:
         params: dict[str, Any] = {"fo": "json", "c": DEFAULT_ROWS_PER_PAGE, "sp": sp}
@@ -847,6 +856,7 @@ def search_loc_paginated(
                     print(
                         f"[warn] search failed for query={query!r} sp={sp}: {exc}"
                     )
+                    request_failed = True
                     break
                 time.sleep(retry_delay_seconds(exc, delay))
                 delay = min(delay * 2, 30.0)
@@ -869,7 +879,7 @@ def search_loc_paginated(
         if isinstance(total_pages, int) and sp > total_pages:
             break
 
-    return results[:max_results]
+    return results[:max_results], request_failed
 
 
 def extract_item_id(result: dict[str, Any]) -> str | None:
@@ -2285,10 +2295,13 @@ def main() -> int:
         f"(every {args.state_upload_interval:.0f}s)"
     )
 
+    search_failures = 0
+    total_candidates_found = 0
+
     for keyword in keywords:
         print(f"\n=== Keyword: {keyword!r} ===")
         try:
-            search_results = search_loc_paginated(
+            search_results, request_failed = search_loc_paginated(
                 session=session,
                 query=keyword,
                 collection=args.collection,
@@ -2300,9 +2313,14 @@ def main() -> int:
             )
         except Exception as exc:
             print(f"[warn] search failed for {keyword!r}: {exc}")
+            search_failures += 1
             continue
 
+        if request_failed:
+            search_failures += 1
+
         print(f"Found {len(search_results)} candidate item(s) for {keyword!r}")
+        total_candidates_found += len(search_results)
 
         for result in search_results:
             process_book(
@@ -2390,7 +2408,18 @@ def main() -> int:
     print(f"Run metadata: {args.run_metadata_path}")
     print(f"Azure state backup: {args.state_azure_prefix} (skipped in dry-run mode)")
 
-    if completed == 0 and failed > 0 and kept_total == 0:
+    if search_failures > 0 and total_candidates_found == 0:
+        print(
+            "\n[warn] Every keyword search failed and no candidate items "
+            "were found at all - if the errors above are all HTTP 403s, "
+            "this is almost certainly LOC's Cloudflare bot protection "
+            "blocking this pipeline's traffic entirely (see module "
+            "docstring's 'IMPORTANT CAVEAT'), not a bug in this script. "
+            "There is nothing this script can do about that from here; "
+            "it would need a network path Cloudflare doesn't challenge "
+            "(e.g. a different egress IP) to get past it."
+        )
+    elif completed == 0 and failed > 0 and kept_total == 0:
         print(
             "\n[warn] Every book failed and none completed - if the errors "
             "above are all HTTP 403s, this may be LOC's Cloudflare bot "
