@@ -1,163 +1,178 @@
 #!/usr/bin/env python3
 """
-gallica_illustration_yolo_pipeline.py
+harvard_yenching_illustration_yolo_pipeline.py
 
-Large-scale BnF Gallica book-page harvesting with GPU YOLO triage, searching
-for pages with RICH ILLUSTRATION. Sibling script to
-bodleian_illustration_yolo_pipeline.py - same one-page-at-a-time GPU triage,
-Azure upload strategy, and page_layout_best_new.pt model, pointed at BnF
-Gallica's SRU search + IIIF APIs instead of Digital Bodleian's.
+Large-scale Harvard-Yenching Library book-page harvesting with GPU YOLO
+triage, searching for pages with RICH ILLUSTRATION. Sibling script to
+bodleian_illustration_yolo_pipeline.py, gallica_illustration_yolo_pipeline.py,
+mdz_illustration_yolo_pipeline.py, wellcome_illustration_yolo_pipeline.py,
+ndl_illustration_yolo_pipeline.py, rmda_illustration_yolo_pipeline.py, and
+loc_illustration_yolo_pipeline.py - same one-page-at-a-time GPU triage,
+Azure upload strategy, and page_layout_best_new.pt model, pointed at
+Harvard's LibraryCloud Item API + a reverse-engineered IIIF manifest
+resolution path instead. Uses the exact same Chinese/Sino-Japanese
+DEFAULT_KEYWORDS list as loc_illustration_yolo_pipeline.py, per user
+instruction.
 
-IMPORTANT - keeping this separate from the Bodleian pipelines' data
+IMPORTANT CAVEAT - manifest resolution is reverse-engineered, not documented
 --------------------------------------------------------------------------
-This is a different library with its own item-id namespace (Gallica ARK
-identifiers, e.g. "bpt6k293231"), so there is no risk of a Gallica item
-literally overwriting a Bodleian blob by name collision the way the two
-Bodleian pipelines could collide with each other. Even so, this script
-follows the exact same "<task>/<library>" file management plan laid out in
-bodleian_illustration_yolo_pipeline.py, so every library's illustration
-search lives in its own clearly labelled corner and nothing has to be
-cross-checked by hand later:
-  - --azure-prefix defaults to "illustrations/gallica" (siblings:
-    "illustrations/bodleian_new", and later "illustrations/loc",
-    "illustrations/british_library", ...),
-  - --negative-audit-prefix defaults to "illustrations/gallica/negative_audit",
-  - --output-dir defaults to "gallica_illustration_yolo_run" (siblings:
-    "bodleian_illustration_yolo_run", ...), so local state/temp files never
-    collide either,
-  - --state-azure-prefix defaults to
-    "state_backups/illustration_runs/gallica_illustration_yolo_run",
-    alongside the Bodleian pipeline's own
-    "state_backups/illustration_runs/bodleian_illustration_yolo_run" under
-    the same "illustration_runs/" umbrella.
-Because the output directories, Azure prefixes, and local temp/tmux
-concerns are all fully separate, this script is safe to run at the same
-time as bodleian_illustration_yolo_pipeline.py in a second tmux session on
-the same RunPod pod - see "Running both pipelines at once" below.
+Harvard's LibraryCloud Item API (https://api.lib.harvard.edu/v2/items.json)
+is documented and worked cleanly during development, but its MODS item
+records do NOT contain a IIIF manifest URL anywhere (confirmed by grepping
+"iiif" case-insensitively across full item JSON - nothing). Harvard's
+modern "Curiosity" viewer platform (curiosity.lib.harvard.edu,
+digitalcollections.library.harvard.edu) - which DOES surface manifest links
+in its UI - sits behind an AWS WAF bot challenge that blocked every request
+made during development (`x-amzn-waf-action: challenge`, HTTP 202 with an
+empty body), so it could not be used as the discovery path either. The
+resolution path this pipeline uses instead was found empirically:
+
+1. LibraryCloud's item JSON exposes extension[].DRSMetadata.fileDeliveryURL,
+   e.g. "https://nrs.harvard.edu/urn-3:FHCL:12221440" - an NRS (Name
+   Resolution Service) permalink for the DRS (Digital Repository Service)
+   object. The "FHCL:12221440" part (see find_yenching_drs_reference()) is
+   used as this pipeline's item_id.
+2. Confirmed live: appending ":METS" to that NRS URN
+   (https://nrs.harvard.edu/urn-3:FHCL:12221440:METS) is NOT behind the WAF
+   and returns a small Mirador-viewer HTML page whose inline script embeds
+   `manifestId: 'https://nrs.harvard.edu/URN-3:FHCL:12221441:MANIFEST:3'`
+   (note the id can differ slightly from the DRS reference in step 1 - it
+   is extracted from this page, never reconstructed by guessing - see
+   resolve_manifest_url()). Fetching THAT URL returns a real, working IIIF
+   Presentation manifest (confirmed live: v2 for single-image "STILL IMAGE"
+   DRS objects, v3 for multi-page "PDS DOCUMENT" objects - both handled by
+   the same version-agnostic parse_iiif_manifest() every sibling pipeline
+   uses).
+3. Confirmed live that this trick does NOT work for Harvard's older
+   "PDS DOCUMENT LIST" content model (a container of several separate
+   documents/volumes) - the ":METS" URN instead 303-redirects to
+   listview.lib.harvard.edu, which IS behind the same WAF. About a quarter
+   of the Harvard-Yenching Chinese Rare Books Digitization Project's items
+   are this container type (confirmed live: 13 of 53 sampled items), and
+   they will consistently fail to resolve a manifest - this is expected,
+   not a bug, and is why every sibling pipeline's book-level retry cap
+   (--max-book-retries) matters here too: these items get retried a few
+   times then permanently give up, exactly like NDL's occasional
+   catalog-references-a-manifest-that-was-never-published items.
+
+Since no IIIF manifest URL exists in the LibraryCloud metadata to begin
+with, book-level metadata (title/date/place/language/subjects/notes) is
+read from the resolved IIIF manifest itself instead (see
+extract_book_metadata()) - the same "manifest-only" convention most sibling
+pipelines use, and it happens to work well here since Harvard's manifests
+carry rich English-labelled metadata (confirmed live - see below).
+
+Restricted to the Harvard-Yenching Library
+------------------------------------------
+Per user instruction, every search result is filtered to items whose
+extension[].librarycloud.HarvardRepositories.HarvardRepository list
+contains "Harvard-Yenching" (confirmed live as the clean, authoritative
+field for this - see find_yenching_drs_reference()). LibraryCloud's search
+itself has no server-side repository filter that was found to work
+(several plausible field names - location, physicalLocation, repository -
+were tried live; "location" cleanly 400s as an undefined Solr field, while
+"physicalLocation"/"repository" are valid fields but silently fail to
+narrow results at all, returning close to the full ~18M-record catalog
+regardless of value), so this pipeline searches LibraryCloud's full index
+with each keyword and filters client-side - see search_harvard_paginated().
+--repository can override the target repository name if ever needed, but
+should normally stay "Harvard-Yenching".
 
 API reference
 -------------
-https://api.bnf.fr/fr/api-document-de-gallica
-https://api.bnf.fr/fr/api-gallica-de-recherche          (SRU search)
-https://api.bnf.fr/fr/api-iiif-de-recuperation-des-images-de-gallica
+https://library.harvard.edu/services-tools/harvard-library-apis-datasets
+https://harvardwiki.atlassian.net/wiki/spaces/LibraryStaffDoc/pages/43287734/LibraryCloud+APIs
 
-Gallica SRU search endpoint: GET https://gallica.bnf.fr/SRU
-    ?operation=searchRetrieve&version=1.2&query=<CQL>
-    &startRecord=<n>&maximumRecords=<0-50>
-Response is XML (srw:searchRetrieveResponse), NOT JSON like the Bodleian/LOC
-search APIs - see parse_sru_records() below. Each srw:record's
-srw:extraRecordData/uri gives the bare ARK identifier (e.g. "bpt6k293231"),
-from which both the human-browsable page
-(https://gallica.bnf.fr/ark:/12148/<ark>) and the IIIF manifest
-(https://gallica.bnf.fr/iiif/ark:/12148/<ark>/manifest.json) are built
-deterministically - confirmed against a live query during development.
-Query syntax is CQL (Contextual Query Language); the "gallica" index
-searches full text + metadata together, and "dc.type" filters by document
-type (monographie, manuscrit, carte, image, fascicule, partition, sonore,
-objet). This pipeline defaults to (dc.type all "monographie" or dc.type all
-"manuscrit") - see --type-filter - to keep results to books/manuscripts
-rather than periodicals, maps, or sound recordings.
-
-Gallica's IIIF manifests are IIIF Presentation API 2.x, structurally
-identical to Digital Bodleian's (top-level "sequences"/"canvases"), so
-parse_iiif_manifest() below is the same walk, just parameterised on image
-width (see "IIIF image size and Gallica's rate limit" below). Confirmed
-live: a Gallica manifest's own "metadata" is a list of {label, value}
-pairs, same shape as Bodleian's, just with a different label vocabulary
-(Title/Creator/Date/Language/Shelfmark/Type/Relation observed; no Subject),
-so extract_book_metadata() below is a straight port with a different
-METADATA_LABELS map, kept as manifest-only (not the richer SRU record) so
-metadata extraction behaves identically whether a book is processed fresh
-or resumed via sweep_paused_books() - exactly like the Bodleian pipeline.
-One consequence: `subjects` in books.jsonl is typically empty for this
-pipeline, since Gallica's IIIF manifest doesn't expose dc:subject the way
-its SRU search response does.
-
-IIIF image size and Gallica's rate limit
------------------------------------------
-BnF's IIIF Image API documentation states a transitional-phase rate limit
-of 5 calls/minute for "full/full" or >1000px requests, with download
-bandwidth capped at 832 Ko/s; exceeding it returns 429 Too Many Requests
-(confirmed via api.bnf.fr and a third-party client's independent
-observation of the same limit). To stay clear of that throttle entirely,
---iiif-width defaults to 1000 (vs. the Bodleian pipeline's 1200) so every
-page request is AT the documented threshold, not above it - confirmed live
-that Gallica's IIIF Image API (profile: image-api/1.1, quality "native",
-also accepts "default") serves /full/1000,/0/default.jpg without issue. If
-you raise --iiif-width above 1000, also raise --image-sleep to at least
-~12-13s (5/min) to respect the documented limit - the pipeline's generic
-429 retry (honours Retry-After) will otherwise absorb the throttle, but
-slowly and wastefully. --image-sleep is intentionally separate from
---sleep (used for SRU search + manifest calls, which aren't documented as
-rate-limited) so the two can be tuned independently.
-
-Workflow
---------
-1. Search Gallica for each keyword in KEYWORDS via SRU (default keywords
-   are French - Gallica's catalogue and OCR text are overwhelmingly
-   French-language, so English keywords would badly under-match; see the
-   English concept -> French keyword table below).
-2. For each matching item, fetch its IIIF manifest (URL built
-   deterministically from the ARK id) and enumerate every page/canvas.
-3. Skip the whole item if it has fewer than --min-pages-per-book pages
-   (default 5) - recorded as "skipped_too_short", never rechecked.
-4. Otherwise walk every page. If the book has MORE than
-   --edge-skip-threshold pages (default 20), the first/last
-   --edge-skip-count pages (default 5 each) are logged (IIIF URL + position,
-   action "skipped_edge_page") but never downloaded or run through YOLO.
-   Every other page is processed ONE PAGE AT A TIME: download -> YOLO on
-   GPU immediately (every detection, class+confidence+bbox, is recorded) ->
-   illustration-positive pages are uploaded to Azure and the local copy
-   deleted; illustration-negative pages are deleted, UNLESS randomly chosen
-   for the negative QC audit sample (--negative-sample-rate), in which case
-   they're uploaded to --negative-audit-prefix instead. Never more than one
-   page image on local disk at a time.
-5. Progress is checkpointed after every page to processed_items.json,
-   resuming a killed run mid-book. A page-level error pauses the book
-   (does NOT advance next_page_index) for retry on the next run, up to
-   --max-page-retries attempts, before the book is marked
-   "failed_permanent".
-6. Every page decision (kept/deleted/skipped/error) is appended to
-   page_log.jsonl.
-7. Book-level bibliographic metadata, the manifest's attribution/license,
-   page counts, illustration-detection totals, and an illustration_density
-   ratio are written to books.jsonl, one line per book.
-8. processed_items.json/books.jsonl/page_log.jsonl are ALSO pushed to
-   Azure under --state-azure-prefix every --state-upload-interval seconds
-   (and once more at the end of the run), each upload overwriting the
-   previous one - a RunPod pod can die without warning.
-
-English concept -> default French keyword
-------------------------------------------
-    geometry     -> géométrie          instruments -> instruments
-    costume      -> costume            ornament    -> ornement
-    heraldry     -> héraldique         medicine    -> médecine
-    illuminated  -> enluminure         atlas       -> atlas
-    astronomy    -> astronomie         cosmography -> cosmographie
-    bestiary     -> bestiaire          book of hours -> livre d'heures
-    apocalypse   -> apocalypse
-Override with --keywords for a different list (e.g. to search Gallica's
-English-language holdings, or add more French terms).
+Search: GET https://api.lib.harvard.edu/v2/items.json
+    ?q=<query>&start=<0-based>&limit=<up to 250, confirmed live>
+Response is JSON: {"pagination": {"numFound": n, ...}, "items": {"mods": [...]}}.
+Documented rate limit: an average of 300 requests per 5 minutes (see "Be a
+good API citizen" below).
 
 Default YOLO model
 -------------------
 Defaults to ./page_layout_best_new.pt (the same fine-tuned model as the
-current bodleian_illustration_yolo_pipeline.py default), classes:
+other seven illustration pipelines' default), classes:
     illustration, text_block
 A page is treated as "contains a rich illustration" when any detected class
 name contains "illustration" (see --illustration-class-keywords).
 
+Workflow
+--------
+1. Search LibraryCloud for each keyword in KEYWORDS (Chinese/Sino-Japanese
+   terms for illustrated genres, natural history, geography, and material
+   culture - identical list to loc_illustration_yolo_pipeline.py), scanning
+   pages of raw results (up to --max-scan-pages per keyword) and keeping
+   only items held by --repository (default "Harvard-Yenching") that
+   expose a DRS reference (see "IMPORTANT CAVEAT" above), until
+   --max-books-per-keyword qualifying items are found.
+2. For each qualifying item, resolve its IIIF manifest (see "IMPORTANT
+   CAVEAT" above) and enumerate every page/canvas.
+3. Skip the whole item if it has fewer than --min-pages-per-book pages
+   (default 5) - recorded as "skipped_too_short", never rechecked (this
+   also naturally screens out standalone "STILL IMAGE" single-photograph
+   records, which resolve a manifest fine but only ever have one canvas).
+4. Otherwise walk every page. If the book has MORE than
+   --edge-skip-threshold pages (default 20), the first/last
+   --edge-skip-count pages (default 5 each) are logged (image URL +
+   position, action "skipped_edge_page") but never downloaded or run
+   through YOLO. Every other page is processed ONE PAGE AT A TIME:
+   download -> YOLO on GPU immediately (every detection, class+confidence+
+   bbox - both pixel and image-normalized, plus its share of the page
+   area - is recorded) -> illustration-positive pages are uploaded to
+   Azure and the local copy deleted; illustration-negative pages are
+   deleted, UNLESS a SHA-256 deterministic sampling decision selects them
+   for the negative QC audit sample (--negative-sample-rate), in which
+   case they're uploaded to --negative-audit-prefix instead. Never more
+   than one page image on local disk at a time.
+5. Progress is checkpointed after every page to processed_items.json,
+   resuming a killed run mid-book. A page-level error pauses the book
+   (does NOT advance next_page_index) for retry on the next run, up to
+   --max-page-retries attempts, before the book is marked
+   "failed_permanent". A book-level failure (manifest couldn't be
+   resolved - expect this for "PDS DOCUMENT LIST" containers, see
+   "IMPORTANT CAVEAT" - or no pages found) is retried on every future run
+   that rediscovers it via search, up to --max-book-retries attempts,
+   before it too is marked "failed_permanent" and stops being retried
+   forever.
+6. Every page decision (kept/deleted/skipped/error) is appended to
+   page_log.jsonl with full provenance: generic source/source_item_id
+   fields alongside the library-specific field kept for backward
+   compatibility, the manifest URL, canvas id/label, page index/number,
+   the IIIF image service URL, the exact requested image URL, the
+   downloaded image's actual pixel dimensions (read from YOLO's own
+   decode - never assumed to equal the requested IIIF width), the source
+   canvas's width/height from the manifest when available, the blob name
+   when uploaded, and - for illustration-negative pages - whether the
+   page was selected for the negative audit sample and the deterministic
+   sampling value used.
+7. Book-level bibliographic metadata (from the manifest - see "IMPORTANT
+   CAVEAT"), page counts, illustration-detection totals, and an
+   illustration_density ratio are written to books.jsonl, one line per
+   book.
+8. processed_items.json/books.jsonl/page_log.jsonl/run_metadata.json are
+   ALSO pushed to Azure under --state-azure-prefix every
+   --state-upload-interval seconds (and once more at the end of the run),
+   each upload overwriting the previous one - a RunPod pod can die without
+   warning.
+9. run_metadata.json is written once, the first time --output-dir is used,
+   and never regenerated on a resumed run (even with different CLI flags) -
+   it records which YOLO model (path + SHA-256 of the weights file), class
+   names, imgsz, confidence threshold, illustration keywords, and
+   Python/PyTorch/Ultralytics/CUDA versions actually produced the corpus in
+   that directory. See load_or_create_run_metadata().
+
 Be a good API citizen
 ----------------------
-No API key is required for Gallica's SRU/IIIF APIs, and BnF's documentation
-states open access "except in case of abusive use" - set
-GALLICA_CONTACT_EMAIL (see below) so the User-Agent identifies this
-research use, and coordinate large harvests with gallica@bnf.fr if running
-this at real scale. Non-commercial reuse of Gallica images requires citing
-"Source gallica.bnf.fr / Bibliothèque nationale de France" - each book
-record in books.jsonl carries the manifest's attribution/license so that
-citation travels with the data. Default --sleep/--image-sleep are
-conservative for the same reason (see "IIIF image size..." above).
+LibraryCloud documents a rate limit of an average of 300 requests per 5
+minutes (1/second) - --sleep defaults conservatively above that per-request
+rate and is applied uniformly to every request this pipeline makes (search,
+manifest resolution, manifest fetch, image downloads), not just LibraryCloud
+search calls specifically. No API key is required. Set
+HARVARD_CONTACT_EMAIL (see below) so the User-Agent identifies this
+research use. Each book record in books.jsonl carries the manifest's
+"Provided by" rights statement (which for Harvard reads "Harvard University
+under these terms: ...") so provenance travels with the data.
 
 Environment
 -----------
@@ -165,7 +180,7 @@ Credentials are read from environment variables (never hardcode them in
 this file, since it goes to GitHub). Put them in a local `.env` (gitignored)
 or set them as RunPod pod environment variables / secrets.
 
-    GALLICA_CONTACT_EMAIL="you@example.org"   # optional but good practice
+    HARVARD_CONTACT_EMAIL="you@example.org"   # optional but good practice
 
 Either:
     AZURE_STORAGE_CONNECTION_STRING="...."
@@ -191,12 +206,10 @@ pip install -r requirements.txt
 
 Running all eight illustration pipelines at once
 ----------------------------------------------------
-This script, bodleian_illustration_yolo_pipeline.py,
-mdz_illustration_yolo_pipeline.py, wellcome_illustration_yolo_pipeline.py,
-ndl_illustration_yolo_pipeline.py, rmda_illustration_yolo_pipeline.py, and
-loc_illustration_yolo_pipeline.py write to fully separate local
-directories and Azure prefixes (see "IMPORTANT" above), so it's safe to run
-all eight concurrently in their own tmux sessions on the same pod:
+This script and the other seven illustration pipelines write to fully
+separate local directories and Azure prefixes (see module docstring
+sections above), so it's safe to run all eight concurrently in their own
+tmux sessions on the same pod:
 
     tmux new -s bodleian_illustration
     conda activate botany_yolo   # or whatever env has torch/ultralytics
@@ -249,21 +262,21 @@ all eight concurrently in their own tmux sessions on the same pod:
     tmux ls                                 # list all sessions
 
 All eight scripts default --device to the same auto-detected cuda:0, so on
-a single-GPU pod they will share that one GPU's compute/VRAM. That's fine
-for a pod like an RTX A4000 (16GB) running eight small YOLO models
-concurrently - they'll interleave GPU time rather than truly run in
-parallel - but if you have a multi-GPU pod, pass --device cuda:1/cuda:2/
-cuda:3/cuda:4 to spread them out.
+a single-GPU pod they will share that one GPU's compute/VRAM - fine for a
+pod like an RTX A4000 (16GB) running eight small YOLO models concurrently
+(they'll interleave GPU time rather than truly run in parallel), but if you
+have a multi-GPU pod, pass --device cuda:1/cuda:2/.../cuda:7 to spread
+them out.
 
 Example
 -------
-python gallica_illustration_yolo_pipeline.py \
+python harvard_yenching_illustration_yolo_pipeline.py \
     --azure-container botany-pages \
     --max-books-per-keyword 100 \
-    --output-dir gallica_illustration_yolo_run
+    --output-dir harvard_yenching_illustration_yolo_run
 
 Dry run (no Azure credentials needed, still deletes local files):
-python gallica_illustration_yolo_pipeline.py --dry-run --max-books-per-keyword 2
+python harvard_yenching_illustration_yolo_pipeline.py --dry-run --max-books-per-keyword 2
 """
 
 from __future__ import annotations
@@ -277,7 +290,6 @@ import re
 import shutil
 import sys
 import time
-import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -292,51 +304,77 @@ try:
 except ImportError:
     pass
 
-GALLICA_BASE = "https://gallica.bnf.fr"
-GALLICA_SRU_URL = f"{GALLICA_BASE}/SRU"
+HARVARD_LIBRARYCLOUD_URL = "https://api.lib.harvard.edu/v2/items.json"
+HARVARD_NRS_BASE = "https://nrs.harvard.edu"
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+# Matches the "{namespace}:{numeric id}" tail of an NRS DRS permalink, e.g.
+# "https://nrs.harvard.edu/urn-3:FHCL:12221440" -> "FHCL:12221440" - see
+# find_yenching_drs_reference().
+DRS_URN_RE = re.compile(r"https?://nrs\.harvard\.edu/urn-3:([A-Za-z0-9._-]+:\d+)", re.IGNORECASE)
+# Matches the inline Mirador config's manifest URL on the ":METS"-suffixed
+# NRS page - see resolve_manifest_url().
+MANIFEST_ID_RE = re.compile(r"manifestId\s*[:=]\s*['\"]([^'\"]+)['\"]")
 
 # Generic source identifier used in page_log.jsonl/run_metadata.json so
 # records from different library pipelines can eventually be pooled and
 # distinguished by a single consistent field name.
-SOURCE_NAME = "gallica"
-SOURCE_DISPLAY_NAME = "BnF Gallica"
+SOURCE_NAME = "harvard_yenching"
+SOURCE_DISPLAY_NAME = "Harvard-Yenching Library"
 
-SRU_NS = {
-    "srw": "http://www.loc.gov/zing/srw/",
-    "oai_dc": "http://www.openarchives.org/OAI/2.0/oai_dc/",
-    "dc": "http://purl.org/dc/elements/1.1/",
-}
-
-_contact = os.environ.get("GALLICA_CONTACT_EMAIL", "").strip()
+_contact = os.environ.get("HARVARD_CONTACT_EMAIL", "").strip()
 USER_AGENT = (
-    "Phyto-Vision-Gallica-Illustration-YOLO-Pipeline/1.0 "
+    "Phyto-Vision-Harvard-Yenching-Illustration-YOLO-Pipeline/1.0 "
     f"(research; contact: {_contact})"
     if _contact
-    else "Phyto-Vision-Gallica-Illustration-YOLO-Pipeline/1.0 "
-    "(research; set GALLICA_CONTACT_EMAIL for a contact address)"
+    else "Phyto-Vision-Harvard-Yenching-Illustration-YOLO-Pipeline/1.0 "
+    "(research; set HARVARD_CONTACT_EMAIL for a contact address)"
 )
 
-# English concept -> default French keyword, see docstring table above.
+# Same keyword list as loc_illustration_yolo_pipeline.py, per user
+# instruction.
 DEFAULT_KEYWORDS = [
-    "géométrie",
-    "instruments",
-    "costume",
-    "ornement",
-    "héraldique",
-    "médecine",
-    "enluminure",
-    "atlas",
-    "astronomie",
-    "cosmographie",
-    "bestiaire",
-    "livre d'heures",
-    "apocalypse",
+    # Explicitly illustrated editions
+    "出像",
+    "全像",
+    "繡像",
+    "圖像",
+    "圖繪",
+    # Illustrated works / visual compilations
+    "圖譜",
+    "畫譜",
+    "圖說",
+    "圖考",
+    "圖錄",
+    "圖經",
+    # Natural history / medicine
+    "本草",
+    "本草圖",
+    "本草圖譜",
+    "草木",
+    "花卉",
+    "鳥獸",
+    "禽鳥",
+    "魚譜",
+    # Geography / maps
+    "輿圖",
+    "地圖",
+    "圖志",
+    "方志",
+    "山水",
+    # Material / technical culture
+    "器物",
+    "器具",
+    "農器",
+    "武備",
+    # Other visually promising genres
+    "譜錄",
+    "博物",
 ]
 
-# Restrict results to books/manuscripts by default, not periodicals, maps,
-# sound recordings, etc. Pass --type-filter with no values to disable.
-DEFAULT_TYPE_FILTER = ["monographie", "manuscrit"]
+# Per user instruction: restrict every search to items held by the
+# Harvard-Yenching Library only - see module docstring.
+DEFAULT_REPOSITORY = "Harvard-Yenching"
 
 DEFAULT_YOLO_MODEL = str(SCRIPT_DIR / "page_layout_best_new.pt")
 DEFAULT_IMGSZ = 640
@@ -344,7 +382,8 @@ DEFAULT_CONF_THRESHOLD = 0.30
 DEFAULT_ILLUSTRATION_CLASS_KEYWORDS = ["illustration"]
 
 DEFAULT_MAX_BOOKS_PER_KEYWORD = 100
-DEFAULT_ROWS_PER_PAGE = 50  # Gallica SRU caps maximumRecords at 50.
+DEFAULT_ROWS_PER_PAGE = 250  # LibraryCloud's own documented/confirmed max.
+DEFAULT_MAX_SCAN_PAGES = 40  # safety cap on raw (pre-filter) pages scanned per keyword.
 DEFAULT_TIMEOUT = 60
 DEFAULT_RETRIES = 5
 DEFAULT_MAX_PAGE_RETRIES = 5
@@ -352,9 +391,9 @@ DEFAULT_MAX_BOOK_RETRIES = 3
 DEFAULT_MIN_PAGES_PER_BOOK = 5
 DEFAULT_EDGE_SKIP_THRESHOLD = 20
 DEFAULT_EDGE_SKIP_COUNT = 5
-DEFAULT_STATE_AZURE_PREFIX = "state_backups/illustration_runs/gallica_illustration_yolo_run"
+DEFAULT_STATE_AZURE_PREFIX = "state_backups/illustration_runs/harvard_yenching_illustration_yolo_run"
 DEFAULT_STATE_UPLOAD_INTERVAL = 3000.0
-DEFAULT_IIIF_WIDTH = 1000  # see "IIIF image size and Gallica's rate limit" above.
+DEFAULT_IIIF_WIDTH = 1200
 DEFAULT_NEGATIVE_SAMPLE_RATE = 0.02
 
 
@@ -414,8 +453,8 @@ def validate_sas_write_permission(sas_url: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Search BnF Gallica for illustration-rich books/manuscripts, "
-            "triage every page with a GPU YOLO model, and stream "
+            "Search Harvard-Yenching Library holdings for illustration-rich "
+            "books, triage every page with a GPU YOLO model, and stream "
             "illustration-positive pages to Azure Blob Storage."
         )
     )
@@ -424,28 +463,40 @@ def parse_args() -> argparse.Namespace:
         "--keywords",
         nargs="*",
         default=None,
-        help="Override the built-in (French) keyword list.",
+        help="Override the built-in (Chinese/Sino-Japanese) keyword list "
+        "(same default list as loc_illustration_yolo_pipeline.py).",
     )
     parser.add_argument(
-        "--type-filter",
-        nargs="*",
-        default=DEFAULT_TYPE_FILTER,
-        help="Gallica dc.type values results are restricted to (ORed "
-        "together), e.g. monographie manuscrit. Pass --type-filter with no "
-        f"values to search all document types. Default: {DEFAULT_TYPE_FILTER}",
+        "--repository",
+        default=DEFAULT_REPOSITORY,
+        help="Harvard repository name to restrict results to (matched "
+        "against extension[].librarycloud.HarvardRepositories."
+        "HarvardRepository) - per project instruction this defaults to "
+        "the Harvard-Yenching Library and should not normally be changed. "
+        f"Default: {DEFAULT_REPOSITORY!r}",
     )
     parser.add_argument(
         "--max-books-per-keyword",
         type=int,
         default=DEFAULT_MAX_BOOKS_PER_KEYWORD,
-        help="Maximum number of Gallica search results to fetch per keyword.",
+        help="Maximum number of qualifying (--repository-held) items to "
+        "find per keyword.",
     )
     parser.add_argument(
-        "--start-record",
+        "--max-scan-pages",
         type=int,
-        default=1,
-        help="SRU startRecord position to start from for each keyword "
-        "(1-based).",
+        default=DEFAULT_MAX_SCAN_PAGES,
+        help="Safety cap on how many raw (pre-repository-filter) result "
+        "pages to scan per keyword before giving up, since LibraryCloud "
+        "search has no working server-side repository filter (see module "
+        f"docstring) - filtering happens client-side. Default: {DEFAULT_MAX_SCAN_PAGES}",
+    )
+    parser.add_argument(
+        "--start-index",
+        type=int,
+        default=0,
+        help="LibraryCloud search 'start' position to begin scanning from "
+        "for each keyword (0-based).",
     )
     parser.add_argument(
         "--limit-pages-per-book",
@@ -459,7 +510,8 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MIN_PAGES_PER_BOOK,
         help="Items with fewer than this many pages are skipped entirely "
         "(recorded as status 'skipped_too_short', no pages downloaded or "
-        f"run through YOLO). Default: {DEFAULT_MIN_PAGES_PER_BOOK}",
+        "run through YOLO) - this also screens out standalone single-image "
+        f"records. Default: {DEFAULT_MIN_PAGES_PER_BOOK}",
     )
     parser.add_argument(
         "--edge-skip-threshold",
@@ -476,16 +528,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of pages to skip at the start AND at the end of a book "
         "whose page count exceeds --edge-skip-threshold. Skipped pages "
         "still get an entry in page_log.jsonl (action 'skipped_edge_page') "
-        "recording their IIIF image URL, but are never downloaded or run "
+        "recording their image URL, but are never downloaded or run "
         f"through YOLO. Default: {DEFAULT_EDGE_SKIP_COUNT}",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("gallica_illustration_yolo_run"),
-        help="Directory for the state file, page log, and the one-page-at-a-"
-        "time temporary download. Kept distinct from the Bodleian "
-        "pipelines' output dirs so local state never collides.",
+        default=Path("harvard_yenching_illustration_yolo_run"),
+        help="Directory for the state file, page log, run metadata, and the "
+        "one-page-at-a-time temporary download. Kept distinct from the "
+        "other pipelines' output dirs so local state never collides.",
     )
 
     # YOLO / GPU
@@ -547,12 +599,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--azure-prefix",
-        default="illustrations/gallica",
+        default="illustrations/harvard_yenching",
         help="Blob name prefix for kept page images. Defaults to "
-        "'illustrations/gallica' (NOT the container root), matching the "
-        "'illustrations/<library>' layout the Bodleian illustration "
-        "pipeline uses, so libraries never collide even inside the same "
-        "container.",
+        "'illustrations/harvard_yenching' (NOT the container root), "
+        "matching the 'illustrations/<library>' layout the other "
+        "illustration pipelines use, so libraries never collide even "
+        "inside the same container.",
     )
     parser.add_argument(
         "--negative-sample-rate",
@@ -568,18 +620,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--negative-audit-prefix",
-        default="illustrations/gallica/negative_audit",
+        default="illustrations/harvard_yenching/negative_audit",
         help="Blob prefix for the negative audit sample. Default: "
-        "illustrations/gallica/negative_audit",
+        "illustrations/harvard_yenching/negative_audit",
     )
     parser.add_argument(
         "--state-azure-prefix",
         default=DEFAULT_STATE_AZURE_PREFIX,
         help="Blob prefix that processed_items.json/books.jsonl/"
-        "page_log.jsonl are periodically pushed to (each upload overwrites "
-        "the previous one), so a RunPod pod dying mid-run doesn't lose "
-        "progress that only exists on local disk. Default: "
-        f"{DEFAULT_STATE_AZURE_PREFIX}",
+        "page_log.jsonl/run_metadata.json are periodically pushed to (each "
+        "upload overwrites the previous one), so a RunPod pod dying "
+        "mid-run doesn't lose progress that only exists on local disk. "
+        f"Default: {DEFAULT_STATE_AZURE_PREFIX}",
     )
     parser.add_argument(
         "--state-upload-interval",
@@ -603,41 +655,31 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_IIIF_WIDTH,
         help="Requested IIIF image width in pixels (0 = full resolution). "
-        "Kept at or below 1000 by default to stay clear of Gallica's "
-        "documented 5-calls/minute throttle on >1000px/full requests - see "
-        f"--image-sleep. Default: {DEFAULT_IIIF_WIDTH}",
+        f"Default: {DEFAULT_IIIF_WIDTH}.",
     )
     parser.add_argument(
         "--timeout",
         type=int,
         default=DEFAULT_TIMEOUT,
-        help="HTTP timeout in seconds for Gallica SRU/IIIF requests.",
+        help="HTTP timeout in seconds for LibraryCloud/NRS/IIIF requests.",
     )
     parser.add_argument(
         "--sleep",
         type=float,
-        default=1.0,
-        help="Delay after each successful SRU search/manifest request. "
-        "Kept conservative since Gallica's general API has no documented "
-        "rate limit but a third party independently found ~1 request/3s "
-        "the threshold before being treated as abusive.",
-    )
-    parser.add_argument(
-        "--image-sleep",
-        type=float,
-        default=None,
-        help="Delay after each successful page image download. Defaults "
-        "to the same value as --sleep. Only needs to be raised above that "
-        "if --iiif-width is raised above 1000 (see --iiif-width) to "
-        "respect Gallica's documented 5-calls/minute image throttle.",
+        default=1.1,
+        help="Delay after each successful request (search, manifest "
+        "resolution, manifest fetch, and image downloads all use this same "
+        "delay). Kept just above LibraryCloud's documented average rate "
+        "limit of 300 requests/5 minutes (1/second) - see module "
+        "docstring.",
     )
     parser.add_argument(
         "--retries",
         type=int,
         default=DEFAULT_RETRIES,
-        help="Maximum HTTP retries per request (search, manifest, and "
-        "image downloads all use the same exponential backoff, honouring "
-        "a Retry-After header on 429s).",
+        help="Maximum HTTP retries per request (search, manifest "
+        "resolution, manifest fetch, and image downloads all use the same "
+        "exponential backoff, honouring a Retry-After header on 429s).",
     )
     parser.add_argument(
         "--max-page-retries",
@@ -651,22 +693,19 @@ def parse_args() -> argparse.Namespace:
         "--max-book-retries",
         type=int,
         default=DEFAULT_MAX_BOOK_RETRIES,
-        help="Maximum times a book-level failure (manifest couldn't be "
-        "fetched, no pages could be resolved, etc. - as opposed to a "
-        "page-level failure, see --max-page-retries) is retried across "
-        "separate runs before the book is marked failed_permanent and "
-        f"stops being re-discovered by future searches. Default: "
-        f"{DEFAULT_MAX_BOOK_RETRIES}",
+        help="Maximum times a book-level failure (no IIIF manifest could "
+        "be resolved - expected for 'PDS DOCUMENT LIST' containers, see "
+        "module docstring - or no pages found, as opposed to a page-level "
+        "failure, see --max-page-retries) is retried across separate runs "
+        "before the book is marked failed_permanent and stops being "
+        f"re-discovered by future searches. Default: {DEFAULT_MAX_BOOK_RETRIES}",
     )
 
-    args = parser.parse_args()
-    if args.image_sleep is None:
-        args.image_sleep = args.sleep
-    return args
+    return parser.parse_args()
 
 
 # --------------------------------------------------------------------------
-# Gallica SRU / IIIF helpers
+# LibraryCloud / NRS / IIIF helpers
 # --------------------------------------------------------------------------
 
 
@@ -675,7 +714,7 @@ def make_session() -> requests.Session:
     session.headers.update(
         {
             "User-Agent": USER_AGENT,
-            "Accept": "application/xml,application/json,image/jpeg,image/png,image/*,*/*;q=0.8",
+            "Accept": "application/json,text/html,image/jpeg,image/png,image/*,*/*;q=0.8",
         }
     )
     return session
@@ -687,11 +726,20 @@ def safe_id(value: str) -> str:
 
 
 def strip_html(value: str) -> str:
-    """Manifest metadata values are sometimes HTML fragments; collapse to
-    plain text."""
+    """Manifest metadata/rights values are sometimes HTML fragments (e.g.
+    a "Provided by" requiredStatement with an embedded <a> link); collapse
+    to plain text."""
     text = re.sub(r"<[^>]+>", "", value)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def as_list(value: Any) -> list[Any]:
+    """MODS-JSON and IIIF-JSON both routinely collapse a single-item list
+    down to a bare object - this normalizes either shape back to a list."""
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
 
 
 def is_permanent_http_error(exc: Exception) -> bool:
@@ -701,11 +749,9 @@ def is_permanent_http_error(exc: Exception) -> bool:
     backoff has no realistic chance of succeeding and just burns time.
 
     429 Too Many Requests is deliberately excluded even though it's a 4xx:
-    Gallica's IIIF API documents exactly this status for its rate limit
-    (see docstring), and it means "you're going too fast" - the definition
-    of transient. It gets the full retry/backoff treatment (honoring
-    Retry-After if the server sends one), same as 5xx errors, timeouts, and
-    connection errors.
+    it means "you're going too fast," which is the definition of transient -
+    it gets the full retry/backoff treatment (honoring Retry-After if the
+    server sends one), same as 5xx errors, timeouts, and connection errors.
     """
     response = getattr(exc, "response", None)
     status_code = getattr(response, "status_code", None)
@@ -770,124 +816,151 @@ def get_json_with_retry(
     raise RuntimeError("Unreachable JSON retry state.")
 
 
-def build_query(keyword: str, type_filter: list[str]) -> str:
+def get_text_with_retry(
+    session: requests.Session,
+    url: str,
+    timeout: int,
+    sleep_seconds: float,
+    retries: int,
+) -> str:
     """
-    CQL query for the Gallica SRU "gallica" index (full text + metadata),
-    optionally ANDed with an ORed dc.type clause to restrict document
-    types. `all` requires every word in `keyword` to appear (not
-    necessarily adjacent) - good enough recall for a multi-word phrase like
-    "livre d'heures" without the stricter phrase-adjacency of `adj`.
+    Same retry policy as get_json_with_retry(), for the ":METS"-suffixed
+    NRS page used by resolve_manifest_url() - that page is HTML, not JSON,
+    so its manifest URL is extracted with MANIFEST_ID_RE rather than parsed
+    as a document.
     """
-    base = f'gallica all "{keyword}"'
-    if not type_filter:
-        return base
-    type_clause = " or ".join(f'dc.type all "{t}"' for t in type_filter)
-    return f"{base} and ({type_clause})"
+    delay = 2.0
+
+    for attempt in range(retries):
+        try:
+            response = session.get(url, timeout=timeout)
+            response.raise_for_status()
+            text = response.text
+            if sleep_seconds:
+                time.sleep(sleep_seconds)
+            return text
+        except Exception as exc:
+            if is_permanent_http_error(exc) or attempt == retries - 1:
+                raise
+            time.sleep(retry_delay_seconds(exc, delay))
+            delay = min(delay * 2, 30.0)
+
+    raise RuntimeError("Unreachable text retry state.")
 
 
-def parse_sru_records(root: ET.Element) -> list[dict[str, Any]]:
+def find_yenching_drs_reference(item: dict[str, Any], repository: str) -> str | None:
     """
-    Extract just enough from an SRU searchRetrieveResponse to drive the
-    pipeline: the bare Gallica ARK id and the (deterministic) IIIF manifest
-    URL. Book-level bibliographic metadata is deliberately NOT sourced here
-    - see the docstring's note on why extract_book_metadata() reads the
-    IIIF manifest instead, so fresh and resumed books behave identically.
+    Returns the "{namespace}:{numeric id}" DRS reference (e.g.
+    "FHCL:12221440") for a LibraryCloud MODS item, but ONLY if the item is
+    held by `repository` (confirmed live as the correct field for this -
+    see module docstring "Restricted to the Harvard-Yenching Library").
+    Returns None for items not held by that repository, or with no usable
+    DRS reference at all (e.g. non-digitized catalog-only records, which
+    make up the overwhelming majority of any generic keyword search - see
+    search_harvard_paginated()).
     """
-    results: list[dict[str, Any]] = []
+    extensions = as_list(item.get("extension"))
 
-    for rec_el in root.findall("srw:records/srw:record", SRU_NS):
-        item_id: str | None = None
-
-        extra_el = rec_el.find("srw:extraRecordData", SRU_NS)
-        if extra_el is not None:
-            uri_el = extra_el.find("uri")
-            if uri_el is not None and uri_el.text:
-                item_id = uri_el.text.strip()
-
-        if not item_id:
-            dc_el = rec_el.find("srw:recordData/oai_dc:dc", SRU_NS)
-            if dc_el is not None:
-                for ident_el in dc_el.findall("dc:identifier", SRU_NS):
-                    match = re.search(r"ark:/12148/([^/\s]+)", ident_el.text or "")
-                    if match:
-                        item_id = match.group(1)
-                        break
-
-        if not item_id:
+    is_held_by_repository = False
+    for entry in extensions:
+        if not isinstance(entry, dict):
             continue
-
-        results.append(
-            {
-                "item_id": item_id,
-                "manifest_url": f"{GALLICA_BASE}/iiif/ark:/12148/{item_id}/manifest.json",
-            }
+        librarycloud = entry.get("librarycloud")
+        if not isinstance(librarycloud, dict):
+            continue
+        repos = as_list(
+            (librarycloud.get("HarvardRepositories") or {}).get("HarvardRepository")
         )
+        if repository in repos:
+            is_held_by_repository = True
+            break
 
-    return results
+    if not is_held_by_repository:
+        return None
+
+    for entry in extensions:
+        if not isinstance(entry, dict):
+            continue
+        drs_metadata = entry.get("DRSMetadata")
+        if not isinstance(drs_metadata, dict):
+            continue
+        url = drs_metadata.get("fileDeliveryURL", "")
+        match = DRS_URN_RE.search(url) if isinstance(url, str) else None
+        if match:
+            return match.group(1)
+
+    return None
 
 
-def search_gallica_paginated(
+def search_harvard_paginated(
     session: requests.Session,
     keyword: str,
-    type_filter: list[str],
+    repository: str,
     max_results: int,
+    max_scan_pages: int,
     timeout: int,
     sleep_seconds: float,
     retries: int = DEFAULT_RETRIES,
-    start_record: int = 1,
+    start_index: int = 0,
 ) -> list[dict[str, Any]]:
-    query = build_query(keyword, type_filter)
+    """
+    Scans LibraryCloud's full-catalog keyword search (no working
+    server-side repository filter was found - see module docstring) and
+    keeps only items held by `repository` with a usable DRS reference,
+    stopping once `max_results` qualifying items are found, the raw result
+    set is exhausted, or `max_scan_pages` raw pages have been scanned
+    without reaching either of those (a generic keyword could in principle
+    never surface enough repository-held hits; this is the safety valve).
+    """
     results: list[dict[str, Any]] = []
-    record_pos = start_record
+    start = start_index
+    scanned_pages = 0
 
-    while len(results) < max_results:
-        params: dict[str, Any] = {
-            "operation": "searchRetrieve",
-            "version": "1.2",
-            "query": query,
-            "startRecord": record_pos,
-            "maximumRecords": DEFAULT_ROWS_PER_PAGE,
-        }
+    while len(results) < max_results and scanned_pages < max_scan_pages:
+        params = {"q": keyword, "start": start, "limit": DEFAULT_ROWS_PER_PAGE}
 
-        root: ET.Element | None = None
+        data: dict[str, Any] | None = None
         delay = 2.0
 
         for attempt in range(retries):
             try:
-                response = session.get(GALLICA_SRU_URL, params=params, timeout=timeout)
+                response = session.get(HARVARD_LIBRARYCLOUD_URL, params=params, timeout=timeout)
                 response.raise_for_status()
-                root = ET.fromstring(response.content)
+                data = response.json()
                 break
             except Exception as exc:
                 if is_permanent_http_error(exc) or attempt == retries - 1:
                     print(
-                        f"[warn] search failed for keyword={keyword!r} "
-                        f"query={query!r}: {exc}"
+                        f"[warn] search failed for keyword={keyword!r} start={start}: {exc}"
                     )
                     break
                 time.sleep(retry_delay_seconds(exc, delay))
                 delay = min(delay * 2, 30.0)
 
-        if root is None:
+        if data is None:
             break
 
-        page_results = parse_sru_records(root)
-        if not page_results:
+        items = as_list((data.get("items") or {}).get("mods"))
+        if not items:
             break
 
-        results.extend(page_results)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            drs_reference = find_yenching_drs_reference(item, repository)
+            if drs_reference:
+                results.append({"item_id": drs_reference})
+                if len(results) >= max_results:
+                    break
+
+        scanned_pages += 1
+        start += DEFAULT_ROWS_PER_PAGE
 
         if sleep_seconds:
             time.sleep(sleep_seconds)
 
-        num_records_text = root.findtext("srw:numberOfRecords", namespaces=SRU_NS)
-        try:
-            num_records = int(num_records_text) if num_records_text else None
-        except ValueError:
-            num_records = None
-
-        record_pos += len(page_results)
-        if num_records is not None and record_pos > num_records:
+        num_found = (data.get("pagination") or {}).get("numFound")
+        if isinstance(num_found, int) and start >= num_found:
             break
 
     return results[:max_results]
@@ -898,9 +971,36 @@ def extract_item_id(result: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def manifest_url_from_result(result: dict[str, Any]) -> str | None:
-    value = result.get("manifest_url")
-    return value if isinstance(value, str) and value else None
+def resolve_manifest_url(
+    session: requests.Session,
+    item_id: str,
+    timeout: int,
+    sleep_seconds: float,
+    retries: int,
+) -> str:
+    """
+    Resolves item_id ("{namespace}:{numeric id}", e.g. "FHCL:12221440") to
+    a working IIIF manifest URL - see module docstring's "IMPORTANT
+    CAVEAT" for the full explanation of why this goes through an
+    intermediate NRS page rather than a fixed URL pattern. Raises if no
+    manifestId could be extracted (expected for "PDS DOCUMENT LIST"
+    containers - see module docstring).
+    """
+    mets_page_url = f"{HARVARD_NRS_BASE}/urn-3:{item_id}:METS"
+    html = get_text_with_retry(session, mets_page_url, timeout, sleep_seconds, retries)
+
+    match = MANIFEST_ID_RE.search(html)
+    if not match:
+        raise RuntimeError(
+            "No IIIF manifest could be resolved for this item (likely a "
+            "legacy 'PDS DOCUMENT LIST' container rather than a single "
+            "document - see module docstring's IMPORTANT CAVEAT)."
+        )
+
+    manifest_url = match.group(1)
+    if manifest_url.startswith("//"):
+        manifest_url = "https:" + manifest_url
+    return manifest_url
 
 
 def service_to_base(service: Any) -> str | None:
@@ -942,12 +1042,12 @@ def image_service_from_body(body: Any) -> str | None:
 def parse_iiif_manifest(manifest: dict[str, Any], width: int) -> list[dict[str, Any]]:
     """
     IIIF-version-agnostic canvas/page walker (Presentation 2 and 3), ported
-    from bodleian_illustration_yolo_pipeline.py. Confirmed live that
-    Gallica manifests are Presentation 2 (top-level "sequences"), same
-    shape as Digital Bodleian's, so this works unchanged apart from the
-    `width` parameter - see "IIIF image size and Gallica's rate limit" in
-    the module docstring for why it defaults to 1000 rather than Bodleian's
-    1200.
+    from the other seven illustration pipelines. Confirmed live that
+    Harvard's resolved manifests are a mix: v2 for single-canvas "STILL
+    IMAGE" DRS objects, v3 for multi-page "PDS DOCUMENT" objects (see
+    module docstring) - both handled here unchanged. Each returned page
+    dict also carries canvas_width/canvas_height when the manifest provides
+    them, which Harvard's do.
     """
     size_segment = f"{width}," if width and width > 0 else "full"
     pages: list[dict[str, Any]] = []
@@ -964,6 +1064,8 @@ def parse_iiif_manifest(manifest: dict[str, Any], width: int) -> list[dict[str, 
                     next(iter(label.get("none", [])), None)
                     or next(iter(label.values()), f"Page {canvas_index + 1}")
                 )
+                if isinstance(label, list):
+                    label = label[0] if label else f"Page {canvas_index + 1}"
 
             service_base: str | None = None
             for annotation_page in canvas.get("items", []):
@@ -1034,50 +1136,80 @@ def parse_iiif_manifest(manifest: dict[str, Any], width: int) -> list[dict[str, 
     return pages
 
 
-# Gallica's IIIF manifest "metadata" label vocabulary, confirmed live
-# against a real manifest - different from Digital Bodleian's, and notably
-# missing a "Subject" label (see docstring note on `subjects`).
+def language_map_values(value: Any, prefer_language: str = "none") -> list[str]:
+    """
+    Harvard's resolved IIIF v3 manifests use the native IIIF language-map
+    shape - {"en": ["..."]} for labels, {"none": ["..."]} for values
+    (confirmed live) - a fifth distinct multi-value convention in this
+    project alongside Bodleian/Gallica's repeated-entry, Wellcome's
+    "; "-packed, MDZ's list-of-{@language,@value}, NDL's "||"-packed, and
+    RMDA's per-language-list forms. Returns the string list for the
+    preferred language, falling back to English, then "none" (IIIF's own
+    placeholder for language-unspecified text), then whichever language
+    happens to be present first. Passes plain strings/lists through
+    unchanged (defensive, for the v2 manifests this pipeline also resolves
+    - see parse_iiif_manifest()'s docstring - which use plain strings, not
+    language maps).
+    """
+    if isinstance(value, str):
+        return [value] if value else []
+
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, str)]
+
+    if isinstance(value, dict):
+        for lang in (prefer_language, "en", "none"):
+            texts = value.get(lang)
+            if isinstance(texts, list) and texts:
+                return [t for t in texts if isinstance(t, str)]
+        for texts in value.values():
+            if isinstance(texts, list):
+                found = [t for t in texts if isinstance(t, str)]
+                if found:
+                    return found
+
+    return []
+
+
+# Harvard manifest metadata label vocabulary (English label text),
+# confirmed live against a resolved v3 manifest - see module docstring.
+# No repeatable "Creator"/"Author" label was observed in the sample
+# checked, but it's included defensively in case other manifests in this
+# corpus expose one.
 METADATA_LABELS = {
-    "title": ["Title"],
-    "author": ["Creator", "Contributor"],
     "date": ["Date"],
-    "subjects": ["Subject"],
+    "author": ["Creator", "Author"],
+    "place_of_origin": ["Place of Origin"],
     "language": ["Language"],
-    "shelfmark": ["Shelfmark"],
-    "document_type": ["Type"],
-    "catalog_notice": ["Relation"],
+    "description": ["Description"],
+    "extent": ["Extent"],
+    "subjects": ["Subject"],
+    "notes": ["Notes"],
 }
 
 
 def extract_book_metadata(manifest: dict[str, Any]) -> dict[str, Any]:
     """
     Best-effort bibliographic metadata extraction from a manifest's
-    top-level "metadata" list of {"label": ..., "value": ...} pairs, ported
-    from bodleian_illustration_yolo_pipeline.py. Gallica manifests observed
-    in the wild mostly use plain-string values, but at least one field
-    ("Format") uses a list of {"@value": ...} dicts instead of plain
-    strings, so that shape is handled too (defensively, for fields beyond
-    Format that might do the same).
+    top-level "metadata" list of {"label": ..., "value": ...} language-map
+    pairs (see language_map_values()) - LibraryCloud's own MODS metadata
+    doesn't help here since it isn't re-derivable on a resumed run (item_id
+    alone doesn't map back to a LibraryCloud record - see
+    sweep_paused_books()), so this pipeline is manifest-only like most
+    siblings, and Harvard's manifests turn out to carry good English-
+    labelled metadata anyway (title, place of origin, date, language,
+    description, extent, subjects, notes - confirmed live).
     """
     by_label: dict[str, list[str]] = {}
     for entry in manifest.get("metadata", []) or []:
         if not isinstance(entry, dict):
             continue
-        label = entry.get("label")
-        value = entry.get("value")
-        if not isinstance(label, str):
+        label_texts = language_map_values(entry.get("label"), prefer_language="en")
+        label = label_texts[0] if label_texts else None
+        if not label:
             continue
 
-        values: list[str] = []
-        if isinstance(value, str):
-            values = [value]
-        elif isinstance(value, list):
-            for v in value:
-                if isinstance(v, str):
-                    values.append(v)
-                elif isinstance(v, dict) and isinstance(v.get("@value"), str):
-                    values.append(v["@value"])
-
+        values = language_map_values(entry.get("value"), prefer_language="none")
         cleaned = [strip_html(v) for v in values if strip_html(v)]
         if cleaned:
             by_label.setdefault(label, []).extend(cleaned)
@@ -1095,19 +1227,32 @@ def extract_book_metadata(manifest: dict[str, Any]) -> dict[str, Any]:
             found.extend(by_label.get(key, []))
         return found
 
-    attribution = strip_html(str(manifest.get("attribution") or ""))
-    license_url = str(manifest.get("license") or "").strip()
-    rights_statement = " | ".join(p for p in (attribution, license_url) if p) or None
+    title = (
+        first("Title")
+        or strip_html(" ".join(language_map_values(manifest.get("label"))))
+        or None
+    )
+
+    required_statement = manifest.get("requiredStatement")
+    rights_statement: str | None = None
+    if isinstance(required_statement, dict):
+        rights_statement = (
+            strip_html(
+                " ".join(language_map_values(required_statement.get("value"), prefer_language="en"))
+            )
+            or None
+        )
 
     return {
-        "title": first(*METADATA_LABELS["title"]),
+        "title": title,
         "author": ", ".join(all_values(*METADATA_LABELS["author"])) or None,
         "date": first(*METADATA_LABELS["date"]),
+        "place_of_origin": first(*METADATA_LABELS["place_of_origin"]),
+        "language": first(*METADATA_LABELS["language"]),
+        "description": first(*METADATA_LABELS["description"]),
+        "extent": first(*METADATA_LABELS["extent"]),
         "subjects": all_values(*METADATA_LABELS["subjects"]),
-        "language": ", ".join(all_values(*METADATA_LABELS["language"])) or None,
-        "shelfmark": first(*METADATA_LABELS["shelfmark"]),
-        "document_type": all_values(*METADATA_LABELS["document_type"]),
-        "catalog_notice": first(*METADATA_LABELS["catalog_notice"]),
+        "notes": " ".join(all_values(*METADATA_LABELS["notes"])) or None,
         "rights_statement": rights_statement,
     }
 
@@ -1392,7 +1537,8 @@ STATE_FILE_CONTENT_TYPES = {".jsonl": "application/x-ndjson", ".json": "applicat
 def upload_state_file_to_blob(container_client, blob_name: str, local_path: Path) -> None:
     """
     Push one local state file (processed_items.json/books.jsonl/
-    page_log.jsonl) to Azure, overwriting whatever was there before.
+    page_log.jsonl/run_metadata.json) to Azure, overwriting whatever was
+    there before.
     """
     from azure.storage.blob import ContentSettings
 
@@ -1580,7 +1726,7 @@ def load_books(path: Path) -> dict[str, dict[str, Any]]:
             if not line:
                 continue
             record = json.loads(line)
-            item_id = record.get("gallica_item_id")
+            item_id = record.get("harvard_item_id")
             if item_id:
                 books[item_id] = record
 
@@ -1627,12 +1773,12 @@ def process_page(
     tmp_path = tmp_dir / f"page_{page_index + 1:05d}_{page_id}.jpg"
 
     record: dict[str, Any] = {
-        # Generic, source-agnostic provenance fields - the same field names
-        # other library pipelines in this project also write, so records
-        # can eventually be pooled.
+        # Generic, source-agnostic provenance fields (see module docstring
+        # workflow step 6) - the same field names other library pipelines
+        # in this project also write, so records can eventually be pooled.
         "source": SOURCE_NAME,
         "source_item_id": item_id,
-        "gallica_item_id": item_id,  # kept for backward compatibility
+        "harvard_item_id": item_id,  # kept for backward compatibility
         "keyword": keyword,
         "manifest_url": manifest_url,
         "canvas_id": page.get("id"),
@@ -1656,15 +1802,13 @@ def process_page(
     }
 
     try:
-        # 1. Download exactly one page image. Uses --image-sleep (not
-        # --sleep) since Gallica's IIIF image endpoint has a documented,
-        # separately-tuned rate limit - see module docstring.
+        # 1. Download exactly one page image.
         download_image_with_retry(
             session=session,
             image_url=page["image_url"],
             output_path=tmp_path,
             timeout=args.timeout,
-            sleep_seconds=args.image_sleep,
+            sleep_seconds=args.sleep,
             retries=args.retries,
         )
 
@@ -1756,7 +1900,7 @@ def log_skipped_edge_page(
     """
     Record a leading/trailing page of a long book WITHOUT downloading it or
     running YOLO - see --edge-skip-threshold/--edge-skip-count. The page's
-    IIIF image URL and position are still written to page_log.jsonl so its
+    image URL and position are still written to page_log.jsonl so its
     existence is never lost, it's just never classified (so
     downloaded_width/height and the negative-audit fields stay null - there
     was no download and no detection to base them on).
@@ -1764,7 +1908,7 @@ def log_skipped_edge_page(
     record: dict[str, Any] = {
         "source": SOURCE_NAME,
         "source_item_id": item_id,
-        "gallica_item_id": item_id,  # kept for backward compatibility
+        "harvard_item_id": item_id,  # kept for backward compatibility
         "keyword": keyword,
         "manifest_url": manifest_url,
         "canvas_id": page.get("id"),
@@ -1798,20 +1942,21 @@ def record_book_failure(
     max_book_retries: int,
 ) -> str:
     """
-    Shared bookkeeping for a book-level failure - the manifest couldn't be
-    fetched, no pages could be resolved from it, or any other exception
-    happened before/instead of the per-page loop (as opposed to a
-    page-level failure, which pauses the book "in_progress" and is capped
-    by a separate mechanism - see --max-page-retries). Tracks
-    book_retry_count across separate runs the same way page-level retries
-    are tracked: once max_book_retries is reached, the book is marked
-    "failed_permanent" (a terminal status, like "completed") so it stops
-    being re-discovered and re-attempted on every future run. Without this
-    cap, a search result whose manifest is permanently missing or broken
-    on the source's end - seen in practice: a library's own catalog can
-    reference a "digitized" item whose manifest was never actually
-    published - would be retried forever, since a plain "failed" status is
-    NOT terminal. Returns the final status assigned, for logging.
+    Shared bookkeeping for a book-level failure - no IIIF manifest could be
+    resolved (expected for "PDS DOCUMENT LIST" containers - see module
+    docstring), no pages could be resolved from a manifest that DID
+    resolve, or any other exception happened before/instead of the
+    per-page loop (as opposed to a page-level failure, which pauses the
+    book "in_progress" and is capped by a separate mechanism - see
+    --max-page-retries). Tracks book_retry_count across separate runs the
+    same way page-level retries are tracked: once max_book_retries is
+    reached, the book is marked "failed_permanent" (a terminal status,
+    like "completed") so it stops being re-discovered and re-attempted on
+    every future run. Without this cap, an item that structurally can
+    never resolve a manifest (the whole "PDS DOCUMENT LIST" category, on
+    current evidence) would be retried forever, since a plain "failed"
+    status is NOT terminal. Returns the final status assigned, for
+    logging.
     """
     previous = state.get(item_id) or {}
     keywords_matched = set(previous.get("keywords_matched", []))
@@ -1844,7 +1989,7 @@ def process_book(
 ) -> None:
     item_id = extract_item_id(result)
     if not item_id:
-        print("[skip] could not determine Gallica ARK id from search result")
+        print("[skip] could not determine Harvard item id from search result")
         return
 
     item_state = state.get(item_id)
@@ -1865,24 +2010,25 @@ def process_book(
     print(f"\n[book] {item_id} (keyword={keyword!r})")
 
     metadata: dict[str, Any] = {}
-    manifest_url: str | None = manifest_url_from_result(result)
+    manifest_url: str | None = None
     total_pages = item_state.get("page_count", 0) if item_state else 0
 
     def flush_book_record(status: str) -> None:
         current = state.get(item_id, {})
         pages_kept = current.get("pages_kept", 0)
         books[item_id] = {
-            "gallica_item_id": item_id,
-            "gallica_url": f"{GALLICA_BASE}/ark:/12148/{item_id}",
+            "harvard_item_id": item_id,
+            "harvard_url": f"{HARVARD_NRS_BASE}/urn-3:{item_id}",
             "manifest_url": manifest_url,
             "title": metadata.get("title"),
             "author": metadata.get("author"),
             "date": metadata.get("date"),
-            "subjects": metadata.get("subjects", []),
+            "place_of_origin": metadata.get("place_of_origin"),
             "language": metadata.get("language"),
-            "shelfmark": metadata.get("shelfmark"),
-            "document_type": metadata.get("document_type", []),
-            "catalog_notice": metadata.get("catalog_notice"),
+            "description": metadata.get("description"),
+            "extent": metadata.get("extent"),
+            "subjects": metadata.get("subjects", []),
+            "notes": metadata.get("notes"),
             "rights_statement": metadata.get("rights_statement"),
             "status": status,
             "total_pages": total_pages,
@@ -1902,8 +2048,9 @@ def process_book(
         save_books_atomic(args.books_path, books)
 
     try:
-        if not manifest_url:
-            raise RuntimeError("Search result had no IIIF manifest URL.")
+        manifest_url = resolve_manifest_url(
+            session, item_id, args.timeout, args.sleep, args.retries
+        )
 
         manifest_data = get_json_with_retry(
             session, manifest_url, args.timeout, args.sleep, args.retries
@@ -1923,9 +2070,12 @@ def process_book(
         raw_total_pages = len(pages)
 
         # Rule: skip items with fewer than --min-pages-per-book pages
-        # entirely - too short to be worth any GPU/bandwidth time. Nothing
-        # is downloaded; just record it as a terminal state so it isn't
-        # re-checked the next time a keyword happens to match it again.
+        # entirely - too short to be worth any GPU/bandwidth time (this
+        # also naturally screens out standalone "STILL IMAGE" single-photo
+        # records, which resolve a manifest fine but only ever have one
+        # canvas). Nothing is downloaded; just record it as a terminal
+        # state so it isn't re-checked the next time a keyword happens to
+        # match it again.
         if raw_total_pages < args.min_pages_per_book:
             print(
                 f"[skip] {item_id}: only {raw_total_pages} page(s) "
@@ -1950,7 +2100,7 @@ def process_book(
         # Rule: for books with more than --edge-skip-threshold pages, don't
         # spend download/GPU time on the leading/trailing
         # --edge-skip-count pages (title pages, flyleaves, colophons are
-        # reliably low-yield for illustration content). Their IIIF URL is
+        # reliably low-yield for illustration content). Their image URL is
         # still logged (see log_skipped_edge_page) so the page isn't lost,
         # just never fetched or classified. Computed against the book's
         # real length (raw_total_pages), not a --limit-pages-per-book cap.
@@ -2126,16 +2276,17 @@ def sweep_paused_books(
     Resume every book currently paused ("in_progress") after a page-level
     error. A book only pauses because download_image_with_retry already
     exhausted its own backoff and still failed - the fix is elapsed
-    wall-clock time (transient Gallica server issues, or a 429 cooldown,
-    tend to clear up), not another immediate retry. Calling this between
-    keyword searches (and once more at the end of the run) gives every
-    paused book that gap naturally, instead of leaving it stuck until the
-    same item happens to resurface under a later keyword's search results.
+    wall-clock time (transient Harvard server issues tend to clear up), not
+    another immediate retry. Calling this between keyword searches (and
+    once more at the end of the run) gives every paused book that gap
+    naturally, instead of leaving it stuck until the same item happens to
+    resurface under a later keyword's search results.
 
-    A resumed book's manifest URL is reconstructed from its ARK id rather
-    than replayed from the original search result (which isn't kept in
-    state), since Gallica's manifest URL is a deterministic function of the
-    ARK id.
+    A resumed book's manifest is re-resolved from its item_id alone
+    (result = {"item_id": ...}) via the same resolve_manifest_url() network
+    call a fresh run uses - LibraryCloud's search result is NOT needed
+    again, since item_id -> manifest resolution never depended on it (see
+    module docstring's IMPORTANT CAVEAT).
     """
     paused_ids = [
         item_id
@@ -2151,10 +2302,7 @@ def sweep_paused_books(
     for item_id in paused_ids:
         keywords_matched = state.get(item_id, {}).get("keywords_matched") or []
         keyword = keywords_matched[-1] if keywords_matched else "resume"
-        result = {
-            "item_id": item_id,
-            "manifest_url": f"{GALLICA_BASE}/iiif/ark:/12148/{item_id}/manifest.json",
-        }
+        result = {"item_id": item_id}
 
         process_book(
             result=result,
@@ -2217,10 +2365,9 @@ def main() -> int:
 
     if not _contact:
         print(
-            "[warn] GALLICA_CONTACT_EMAIL is not set; the User-Agent sent "
-            "to Gallica has no contact address. Good practice for a large "
-            "harvest - consider setting it, and coordinate with "
-            "gallica@bnf.fr for real scale."
+            "[warn] HARVARD_CONTACT_EMAIL is not set; the User-Agent sent "
+            "to Harvard has no contact address. Good practice for any "
+            "harvest - consider setting it."
         )
 
     state = load_state(args.state_path)
@@ -2229,12 +2376,12 @@ def main() -> int:
 
     keywords = args.keywords or DEFAULT_KEYWORDS
     print(f"Keywords ({len(keywords)}): {', '.join(keywords)}")
-    print(f"Type filter: {args.type_filter or '(none - all document types)'}")
+    print(f"Repository: {args.repository}")
     print(f"YOLO model: {args.yolo_model}")
     print(f"Illustration class keywords: {args.illustration_class_keywords}")
     print(f"Output dir: {args.output_dir}")
     print(f"IIIF image width: {args.iiif_width or 'full resolution'}")
-    print(f"Sleep: {args.sleep}s (search/manifest)  {args.image_sleep}s (images)")
+    print(f"Negative audit sample rate: {args.negative_sample_rate}")
     print(f"Azure image prefix: {args.azure_prefix}")
     print(
         f"Azure state backup prefix: {args.state_azure_prefix} "
@@ -2244,21 +2391,25 @@ def main() -> int:
     for keyword in keywords:
         print(f"\n=== Keyword: {keyword!r} ===")
         try:
-            search_results = search_gallica_paginated(
+            search_results = search_harvard_paginated(
                 session=session,
                 keyword=keyword,
-                type_filter=args.type_filter,
+                repository=args.repository,
                 max_results=args.max_books_per_keyword,
+                max_scan_pages=args.max_scan_pages,
                 timeout=args.timeout,
                 sleep_seconds=args.sleep,
                 retries=args.retries,
-                start_record=args.start_record,
+                start_index=args.start_index,
             )
         except Exception as exc:
             print(f"[warn] search failed for {keyword!r}: {exc}")
             continue
 
-        print(f"Found {len(search_results)} candidate item(s) for {keyword!r}")
+        print(
+            f"Found {len(search_results)} {args.repository}-held candidate "
+            f"item(s) for {keyword!r}"
+        )
 
         for result in search_results:
             process_book(
@@ -2274,9 +2425,9 @@ def main() -> int:
                 keyword=keyword,
             )
             # RunPod pods can die without warning, so push the current
-            # state/books/page-log files to Azure every so often (rate
-            # limited by --state-upload-interval), overwriting the previous
-            # backup each time.
+            # state/books/page-log/run-metadata files to Azure every so
+            # often (rate limited by --state-upload-interval), overwriting
+            # the previous backup each time.
             maybe_backup_state_to_azure(container_client, args)
 
         sweep_paused_books(
@@ -2333,7 +2484,7 @@ def main() -> int:
     print(f"Books completed: {completed}")
     print(f"Books paused for retry (in_progress): {in_progress}")
     print(f"Books failed (will retry next run): {failed}")
-    print(f"Books failed_permanent (gave up, page retries exhausted): {failed_permanent}")
+    print(f"Books failed_permanent (gave up, page/book retries exhausted): {failed_permanent}")
     print(f"Books skipped_too_short (< --min-pages-per-book): {skipped_too_short}")
     print(f"Pages kept (uploaded to Azure): {kept_total}")
     print(f"Pages deleted (no illustration detected): {deleted_total}")
